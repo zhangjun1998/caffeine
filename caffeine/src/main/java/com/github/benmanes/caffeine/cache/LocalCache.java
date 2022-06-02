@@ -107,6 +107,7 @@ interface LocalCache<K, V> extends ConcurrentMap<K, V> {
 
   @Override
   default @Nullable V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction) {
+    // 这里会调用子类重写的方法
     return computeIfAbsent(key, mappingFunction, /* recordStats */ true, /* recordLoad */ true);
   }
 
@@ -114,8 +115,10 @@ interface LocalCache<K, V> extends ConcurrentMap<K, V> {
    * See {@link ConcurrentMap#computeIfAbsent}. This method differs by accepting parameters
    * indicating how to record statistics.
    */
-  @Nullable V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction,
-      boolean recordStats, boolean recordLoad);
+  /**
+   * 这里就是缓存获取和加载的核心了，类似于 Map的 computeIfAbsent() 方法
+   */
+  @Nullable V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction, boolean recordStats, boolean recordLoad);
 
   /** See {@link Cache#invalidateAll(Iterable)}. */
   default void invalidateAll(Iterable<?> keys) {

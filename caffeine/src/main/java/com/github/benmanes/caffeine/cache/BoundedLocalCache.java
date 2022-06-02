@@ -193,6 +193,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
 
   static final Logger logger = System.getLogger(BoundedLocalCache.class.getName());
 
+  // 写缓冲区相关，最大容量与 CPU 核心数相关
   /** The number of CPUs */
   static final int NCPU = Runtime.getRuntime().availableProcessors();
   /** The initial capacity of the write buffer. */
@@ -201,12 +202,17 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   static final int WRITE_BUFFER_MAX = 128 * ceilingPowerOfTwo(NCPU);
   /** The number of attempts to insert into the write buffer before yielding. */
   static final int WRITE_BUFFER_RETRIES = 100;
+
   /** The maximum weighted capacity of the map. */
+  // 缓存最大容量阈值
   static final long MAXIMUM_CAPACITY = Long.MAX_VALUE - Integer.MAX_VALUE;
   /** The initial percent of the maximum weighted capacity dedicated to the main space. */
+  // main 空间的初始百分比，剩下的 0.01 为 window 部分，也就是说 window 和 main 的占比为 1:99
   static final double PERCENT_MAIN = 0.99d;
   /** The percent of the maximum weighted capacity dedicated to the main's protected space. */
+  // main 空间中 protect 部分的初始百分比，main 空间中 probation 与 protect的占比为 20:80
   static final double PERCENT_MAIN_PROTECTED = 0.80d;
+
   /** The difference in hit rates that restarts the climber. */
   static final double HILL_CLIMBER_RESTART_THRESHOLD = 0.05d;
   /** The percent of the total size to adapt the window by. */
@@ -217,24 +223,42 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   static final int QUEUE_TRANSFER_THRESHOLD = 1_000;
   /** The maximum time window between entry updates before the expiration must be reordered. */
   static final long EXPIRE_WRITE_TOLERANCE = TimeUnit.SECONDS.toNanos(1);
+
   /** The maximum duration before an entry expires. */
+  // 最大过期时间
   static final long MAXIMUM_EXPIRY = (Long.MAX_VALUE >> 1); // 150 years
   /** The duration to wait on the eviction lock before warning that of a possible misuse. */
+  // 获取 evictionLock 的最大等待时间
   static final long WARN_AFTER_LOCK_WAIT_NANOS = TimeUnit.SECONDS.toNanos(30);
   /** The handle for the in-flight refresh operations. */
+  // 指向 refreshes，用于提供原子操作
   static final VarHandle REFRESHES;
 
+  // 移除事件监听器
   final @Nullable RemovalListener<K, V> evictionListener;
+  // 缓存加载器
   final @Nullable AsyncCacheLoader<K, V> cacheLoader;
 
+  // 写缓冲区，它是一个队列，允许无锁的高并发写入，但只允许一个消费者，用于重放写操作来执行一些写操作后需要的处理；它存储的是 Runnable 类型的任务；
+  // 写缓冲区用来重放写操作来执行一些写操作后需要的处理，用来帮助 基于最后写入时间驱逐 的执行；
+  // 它需要尽量保证无丢失和低延迟，如果丢失/延迟就会导致最后写入时间错误，进而导致即使本次写入缓存当时是成功的，但可能会因为最后写入时间还是上次的写入时间而把本次刚写进去的元素驱逐掉，造成写缓存丢失
   final MpscGrowableArrayQueue<Runnable> writeBuffer;
+  // 缓存实例，起始就是 ConcurrentHashMap 对象，只是 key 和 value 都被包装了用来实现缓存的一些特性
   final ConcurrentHashMap<Object, Node<K, V>> data;
+  // 缓存清理任务
   final PerformCleanupTask drainBuffersTask;
+  // 读取操作后需要执行的策略
   final Consumer<Node<K, V>> accessPolicy;
+  // 读缓冲区，它是一个带状缓冲区，每个线程在带状缓冲区上有自己的桶位，每个桶位都是一个环形缓冲区，这样来减少线程竞争；它存储的是 Node 本身
+  // 读缓冲区用来重放读操作来执行一些读操作后需要的处理，用来帮助 基于容量驱逐和基于最后读取时间驱逐 的执行；它可以接收一些丢失/延迟，这对业务没什么影响
   final Buffer<Node<K, V>> readBuffer;
+  // 用于 Node 相关的操作，如创建、引用包装等
   final NodeFactory<K, V> nodeFactory;
+  // 在驱逐时候加的锁
   final ReentrantLock evictionLock;
+  // 权重策略
   final Weigher<K, V> weigher;
+  // 线程池，默认使用 ForkJoinPool.commonPool()
   final Executor executor;
 
   final boolean isWeighted;
@@ -243,25 +267,39 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   @Nullable Set<K> keySet;
   @Nullable Collection<V> values;
   @Nullable Set<Entry<K, V>> entrySet;
+  // 自动刷新任务
   @Nullable volatile ConcurrentMap<Object, CompletableFuture<?>> refreshes;
 
   /** Creates an instance based on the builder's configuration. */
-  protected BoundedLocalCache(Caffeine<K, V> builder,
-      @Nullable AsyncCacheLoader<K, V> cacheLoader, boolean isAsync) {
+  /**
+   * 这个构造函数会在动态生成的子类的构造器中调用
+   */
+  protected BoundedLocalCache(Caffeine<K, V> builder, @Nullable AsyncCacheLoader<K, V> cacheLoader, boolean isAsync) {
+    // 是否异步
     this.isAsync = isAsync;
+    // 自动加载器
     this.cacheLoader = cacheLoader;
+    // 线程池，用来执行移除事件回调、缓存自动刷新、缓存维护等耗时操作
     executor = builder.getExecutor();
     isWeighted = builder.isWeighted();
+    // 这把锁很多地方都用到，注意
     evictionLock = new ReentrantLock();
     weigher = builder.getWeigher(isAsync);
+    // 用于驱逐缓存的任务
     drainBuffersTask = new PerformCleanupTask(this);
+    // 节点工厂，用于包装 key-value，一个 Node 中包含 key、value 等属性
     nodeFactory = NodeFactory.newFactory(builder, isAsync);
+    // 移除事件监听器
     evictionListener = builder.getEvictionListener(isAsync);
+    // 实际的数据存储容器就是 ConcurrentHashMap，只是其中存储的value通过 Node<K, V> 包装了一遍
     data = new ConcurrentHashMap<>(builder.getInitialCapacity());
+    // 读缓冲区
     readBuffer = evicts() || collectKeys() || collectValues() || expiresAfterAccess()
         ? new BoundedBuffer<>()
         : Buffer.disabled();
+    // 读取策略，在缓存有过期/容量限制时使用到，会在清理 readBuffer/writeBuffer 时调用，用来更新 node 在所属队列中的顺序和访问频率，方便 W-TinyLFU 算法回收
     accessPolicy = (evicts() || expiresAfterAccess()) ? this::onAccess : e -> {};
+    // 写缓冲区
     writeBuffer = new MpscGrowableArrayQueue<>(WRITE_BUFFER_MIN, WRITE_BUFFER_MAX);
 
     if (evicts()) {
@@ -290,21 +328,50 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     return isAsync && !Async.isReady((CompletableFuture<?>) node.getValue());
   }
 
+  /**
+   * Window-TinyLFU 算法
+   *
+   * 整个缓存区域被划分为 window 和 main，window 与 main 的空间占比为 0.01 : 0.99 ，即 1：99，这一点在上面的常量定义中体现
+   * main 空间又被划分为 probation 和 protect，它们的占比为 20:80，probation 用于存储冷数据，protect 用于存储热数据
+   * window 区域主要用于应对突发流量，它使用 LRU 算法进行淘汰
+   * main 区域则使用 SLRU 和 TinyLFU 算法进行淘汰，其中 SLRU 体现在 probation 和 protected，TinyLFU 则体现在 protected
+   *
+   * 新数据首先进入到 window 区域，如果 window 满，则会通过 LRU 进行淘汰晋升到 probation 区域。window 队列元素被访问后会被移动到队列尾部
+   * 元素的淘汰发生在 probation 区域，如果总容量超出，则会对 probation 队列的首尾元素进行频率PK，淘汰访问频率低的。probation 队列元素被访问后，该元素会晋升到 protected 区域
+   * protected 区域的元素是比较稳定的，如果容量超出，则淘汰的元素会进入到 probation 队列，在 probation 队列中重新进行淘汰。protected 队列元素被访问后会被移动到队列尾部
+   */
+
+  // ====== 顺序读队列 =======
+
+  /**
+   * 顺序读队列，用于存放 W-TinyLFU 算法中 window 区域的数据
+   * 属于 window 区，占据的空间百分比初始化为1%
+   */
   @GuardedBy("evictionLock")
   protected AccessOrderDeque<Node<K, V>> accessOrderWindowDeque() {
     throw new UnsupportedOperationException();
   }
 
+  /**
+   * 顺序读队列，用于存放 W-TinyLFU 算法中 probation 区域的数据
+   * 属于 main 区，占据main空间的百分比初始化为20%
+   * 使用 LRU 算法进行淘汰
+   */
   @GuardedBy("evictionLock")
   protected AccessOrderDeque<Node<K, V>> accessOrderProbationDeque() {
     throw new UnsupportedOperationException();
   }
-
+  // 熟悉读队列，用于存放 W-TinyLFU 算法中 protect 区域的数据；属于 main 区，占据main空间的百分比初始化为80%
   @GuardedBy("evictionLock")
   protected AccessOrderDeque<Node<K, V>> accessOrderProtectedDeque() {
     throw new UnsupportedOperationException();
   }
 
+  // ========= 顺序写队列 =========
+  /**
+   * 顺序写队列，用于 expireAfterWrite 的驱逐策略
+   * 它的入队出队操作被封装在 writeBuffer 中的任务中，AddTask、UpdateTask、RemoveTask 都会对该队列进行操作
+   */
   @GuardedBy("evictionLock")
   protected WriteOrderDeque<Node<K, V>> writeOrderDeque() {
     throw new UnsupportedOperationException();
@@ -369,6 +436,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     return false;
   }
 
+  // 丢到线程池处理
   @Override
   public void notifyRemoval(@Nullable K key, @Nullable V value, RemovalCause cause) {
     if (!hasRemovalListener()) {
@@ -405,20 +473,30 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   /* --------------- Reference Support --------------- */
 
   /** Returns if the keys are weak reference garbage collected. */
+  // key 是否被 弱引用包装，导致可能被GC收集
   protected boolean collectKeys() {
     return false;
   }
 
   /** Returns if the values are weak or soft reference garbage collected. */
+  // key 是否被弱引用/软引用包装，导致可能被GC收集
   protected boolean collectValues() {
     return false;
   }
 
+  /**
+   * 弱引用 key 关联的 ReferenceQueue，GC回收时会将 key 放到该队列中，起到通知作用
+   * 在新建 node 或 key 时会关联该 ReferenceQueue
+   */
   @SuppressWarnings("NullAway")
   protected ReferenceQueue<K> keyReferenceQueue() {
     return null;
   }
 
+  /**
+   * 弱引用/软引用 value 关联的 ReferenceQueue，GC回收时会将 value 放到该队列中，起到通知作用
+   * 在新建 node 或 setValue 时会关联该 ReferenceQueue
+   */
   @SuppressWarnings("NullAway")
   protected ReferenceQueue<V> valueReferenceQueue() {
     return null;
@@ -663,12 +741,17 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /** Evicts entries if the cache exceeds the maximum. */
+  /**
+   * 缓存容量达到上限，根据 W-TinyLFU 算法驱逐元素
+   */
   @GuardedBy("evictionLock")
   void evictEntries() {
     if (!evicts()) {
       return;
     }
+    // 先从 window 区域驱逐，返回从 window 区域驱逐的元素数量
     int candidates = evictFromWindow();
+    // 再从 main 区域驱逐
     evictFromMain(candidates);
   }
 
@@ -677,6 +760,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    * maximum.
    *
    * @return the number of candidate entries evicted from the window space
+   */
+  /**
+   * 驱逐 window 区域的数据
    */
   @GuardedBy("evictionLock")
   int evictFromWindow() {
@@ -847,8 +933,11 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   @GuardedBy("evictionLock")
   void expireEntries() {
     long now = expirationTicker().read();
+    // afterAccess 读后指定时间失效
     expireAfterAccessEntries(now);
+    // afterWrite 写后指定时间失效
     expireAfterWriteEntries(now);
+    // 自定义失效策略，时间轮淘汰
     expireVariableEntries(now);
 
     Pacer pacer = pacer();
@@ -947,10 +1036,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
 
   /** Returns if the entry has expired. */
   @SuppressWarnings("ShortCircuitBoolean")
+  // node 是否过期
   boolean hasExpired(Node<K, V> node, long now) {
     if (isComputingAsync(node)) {
       return false;
     }
+    // 这里会校验所有的过期策略，包括 基于最后读取时间、基于最后写入时间、基于自定义过期策略，只要任一校验通过即可
+    // 正是因为这些校验，因此 afterRead 操作才需要尽量立即清理缓冲区，因为如果不及时更新最后写入时间，这次的读操作读取到的就还是上次的写入时间，如果上次写入时间到期就会重新加载/驱逐进而导致最近的写操作丢失
     return (expiresAfterAccess() && (now - node.getAccessTime() >= expiresAfterAccessNanos()))
         | (expiresAfterWrite() && (now - node.getWriteTime() >= expiresAfterWriteNanos()))
         | (expiresVariable() && (now - node.getVariableTime() >= 0));
@@ -965,33 +1057,46 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    * @param now the current time, used only if expiring
    * @return if the entry was evicted
    */
+  /**
+   * 驱逐 node
+   */
   @GuardedBy("evictionLock")
   @SuppressWarnings({"PMD.CollapsibleIfStatements", "GuardedByChecker", "NullAway"})
   boolean evictEntry(Node<K, V> node, RemovalCause cause, long now) {
     K key = node.getKey();
     @SuppressWarnings("unchecked")
     V[] value = (V[]) new Object[1];
+    // node 是否移除
     boolean[] removed = new boolean[1];
+    // node 是否复活
     boolean[] resurrect = new boolean[1];
+    // node 的key
     Object keyReference = node.getKeyReference();
+    // 移除原因
     RemovalCause[] actualCause = new RemovalCause[1];
 
+    // 这里主要用于移除的善后工作，比如移除原因、移除通知、
     data.computeIfPresent(keyReference, (k, n) -> {
       if (n != node) {
         return n;
       }
+
+      // 这里主要在将 node 的状态置为 dead，并进行移除事件回调(节点、原因...)
       synchronized (n) {
         value[0] = n.getValue();
 
+        // 找到移除原因
         if ((key == null) || (value[0] == null)) {
           actualCause[0] = RemovalCause.COLLECTED;
         } else if (cause == RemovalCause.COLLECTED) {
+          // 如果是 GC 移除的直接复活原 node
           resurrect[0] = true;
           return n;
         } else {
           actualCause[0] = cause;
         }
 
+        // 移除原因是过期
         if (actualCause[0] == RemovalCause.EXPIRED) {
           boolean expired = false;
           if (expiresAfterAccess()) {
@@ -1003,27 +1108,38 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
           if (expiresVariable()) {
             expired |= (n.getVariableTime() <= now);
           }
+          // 实际没有过期，复活原 node，不移除
           if (!expired) {
             resurrect[0] = true;
             return n;
           }
-        } else if (actualCause[0] == RemovalCause.SIZE) {
+        }
+        // 移除原因是空间不足
+        else if (actualCause[0] == RemovalCause.SIZE) {
           int weight = node.getWeight();
+          // 节点的权重为0，复活原 node，不移除
           if (weight == 0) {
             resurrect[0] = true;
             return n;
           }
         }
 
+        // 到这里说明 node 是真的应该被移除，触发移除事件通知
         notifyEviction(key, value[0], actualCause[0]);
+        // 设置 node 状态为 dead 并且减少所在区域的权重
         makeDead(n);
       }
+
+
+      // 丢弃该key正在进行的刷新任务
       discardRefresh(keyReference);
       removed[0] = true;
+
+      // 返回null，表示将该 value 从 ConcurrentHashMap 中移除
       return null;
     });
 
-    // The entry is no longer eligible for eviction
+    // 节点被复活，没有驱逐
     if (resurrect[0]) {
       return false;
     }
@@ -1031,33 +1147,45 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     // If the eviction fails due to a concurrent removal of the victim, that removal may cancel out
     // the addition that triggered this eviction. The victim is eagerly unlinked before the removal
     // task so that if an eviction is still required then a new victim will be chosen for removal.
+    // 判断是否配置了驱逐策略，将 node 从其所属的队列中移除
     if (node.inWindow() && (evicts() || expiresAfterAccess())) {
+      // W-TinyLFU 算法，window 部分
       accessOrderWindowDeque().remove(node);
     } else if (evicts()) {
       if (node.inMainProbation()) {
+        // W-TinyLFU 算法，probation 部分
         accessOrderProbationDeque().remove(node);
       } else {
+        // W-TinyLFU 算法，protect 部分
         accessOrderProtectedDeque().remove(node);
       }
     }
+
+    // 从 writeOrderDeque 中移除
     if (expiresAfterWrite()) {
       writeOrderDeque().remove(node);
     } else if (expiresVariable()) {
+      // 从时间轮中移除
       timerWheel().deschedule(node);
     }
 
+    // 节点移除成功
     if (removed[0]) {
+      // 统计
       statsCounter().recordEviction(node.getWeight(), actualCause[0]);
 
       // Notify the listener only if the entry was evicted. This must be performed as the last
       // step during eviction to safeguard against the executor rejecting the notification task.
+      // 移除事件通知
       notifyRemoval(key, value[0], actualCause[0]);
     } else {
       // Eagerly decrement the size to potentially avoid an additional eviction, rather than wait
       // for the removal task to do it on the next maintenance cycle.
+      // 移除失败，将 node 设置为 dead 状态
       makeDead(node);
     }
 
+    // 返回移除结果
     return true;
   }
 
@@ -1226,15 +1354,25 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    * @param recordHit if the hit count should be incremented
    * @return the refreshed value if immediately loaded, else null
    */
+  /**
+   * 读操作后的处理，将读到的 node 丢到 readBuffer 中，如果 readBuffer 满了就顺带清理一波
+   */
   @Nullable V afterRead(Node<K, V> node, long now, boolean recordHit) {
     if (recordHit) {
       statsCounter().recordHits(1);
     }
 
+    // 注意这里和 afterWrite() 的区别，afterRead 中不要求立即执行 scheduleDrainBuffers，而是先尝试丢到读缓冲区中，只有读缓冲区满了才进行清理
+    // 这是因为 read 操作并不需要保证不丢，延迟高点也可以接受，所以不需要每次 read 都清理缓冲区
+
+    // 处理读缓冲区，简单来说就是缓冲区被写满就处理
     boolean delayable = skipReadBuffer() || (readBuffer.offer(node) != Buffer.FULL);
     if (shouldDrainBuffers(delayable)) {
+      // 这里会进行缓存维护，而不仅仅是清理读缓冲区
       scheduleDrainBuffers();
     }
+
+    // 是否需要自动刷新，这里说明自动刷新操作是在读操作后才触发的，没有读操作则缓存不会自动刷新
     return refreshIfNeeded(node, now);
   }
 
@@ -1409,8 +1547,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    * @param now the current time, in nanoseconds
    * @return the expiration time
    */
-  long expireAfterRead(Node<K, V> node, @Nullable K key,
-      @Nullable V value, Expiry<K, V> expiry, long now) {
+  // 返回 read 操作后的下次失效时间
+  long expireAfterRead(Node<K, V> node, @Nullable K key, @Nullable V value, Expiry<K, V> expiry, long now) {
     if (expiresVariable() && (key != null) && (value != null)) {
       long currentDuration = Math.max(1, node.getVariableTime() - now);
       long duration = expiry.expireAfterRead(key, value, now, currentDuration);
@@ -1428,8 +1566,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    * @param expiry the calculator for the expiration time
    * @param now the current time, in nanoseconds
    */
-  void tryExpireAfterRead(Node<K, V> node, @Nullable K key,
-      @Nullable V value, Expiry<K, V> expiry, long now) {
+  // 尝试在读取操作后更新过期时间
+  void tryExpireAfterRead(Node<K, V> node, @Nullable K key, @Nullable V value, Expiry<K, V> expiry, long now) {
     if (!expiresVariable() || (key == null) || (value == null)) {
       return;
     }
@@ -1448,6 +1586,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     }
   }
 
+  /**
+   * 设置可存活时间，这用在自定义 Expire 过期策略中
+   */
   void setVariableTime(Node<K, V> node, long expirationTime) {
     if (expiresVariable()) {
       node.setVariableTime(expirationTime);
@@ -1471,14 +1612,29 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    *
    * @param task the pending operation to be applied
    */
+  /**
+   * 写操作后的一些处理，主要是将写行为封装为对应的task 丢到 writeBuffer 中，如果写缓冲区满了就顺带进行一次缓存维护
+   *  写操作相关的 Task：{@link AddTask}、{@link UpdateTask}、{@link RemovalTask}
+   *  在这些 Task 中都会对 {@link #writeOrderDeque()} 进行操作
+   */
   void afterWrite(Runnable task) {
+
+    // 注意这里和 afterRead() 的区别，afterRead() 在缓冲区空闲的时候不会立即清理缓冲区，只有缓冲区满才会进行一次清理；
+    // 这里是为了保证 write 操作不会丢失，并且降低延迟，会在 offer 成功后尽量进行一次缓存清理任务的调度
+    // 其实我觉得没必要为了这个降低性能，
+
+    // 循环重试，最大重试100次
     for (int i = 0; i < WRITE_BUFFER_RETRIES; i++) {
+      // 加入写缓冲区成功，会立即调度清理缓冲区的任务，即使缓冲区还是空闲的
       if (writeBuffer.offer(task)) {
         scheduleAfterWrite();
         return;
       }
+      // 加入写缓冲失败，清理读、写缓冲区
       scheduleDrainBuffers();
     }
+
+    // 重试100次都加入写缓冲失败，那就开始进行缓存维护吧
 
     // In scenarios where the writing threads cannot make progress then they attempt to provide
     // assistance by performing the eviction work directly. This can resolve cases where the
@@ -1491,6 +1647,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     // logged to encourage the application to decouple these computations from the map operations.
     lock();
     try {
+      // 维护缓存
       maintenance(task);
     } catch (RuntimeException e) {
       logger.log(Level.ERROR, "Exception thrown when performing the maintenance task", e);
@@ -1561,27 +1718,43 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    * Attempts to schedule an asynchronous task to apply the pending operations to the page
    * replacement policy. If the executor rejects the task then it is run directly.
    */
+  /**
+   * 清理读、写缓冲区，这里会触发缓存维护操作
+   * 注意这个操作会在读写缓冲区任意一个满的时候都会执行
+   */
   void scheduleDrainBuffers() {
+    // 缓冲区正在清理中，直接返回
     if (drainStatus() >= PROCESSING_TO_IDLE) {
       return;
     }
+
+    // 对缓冲区的清理过程加锁
     if (evictionLock.tryLock()) {
       try {
         int drainStatus = drainStatus();
         if (drainStatus >= PROCESSING_TO_IDLE) {
           return;
         }
+
+        // 原子更新缓冲区状态为处理中
         setDrainStatusRelease(PROCESSING_TO_IDLE);
+        // 将缓存维护的操作封装为 task 丢到线程池执行
         executor.execute(drainBuffersTask);
+
       } catch (Throwable t) {
         logger.log(Level.WARNING, "Exception thrown when submitting maintenance task", t);
+        // 提交任务到线程池执行出错，直接同步执行缓存维护工作
         maintenance(/* ignored */ null);
       } finally {
+        // 释放锁
         evictionLock.unlock();
       }
     }
   }
 
+  /**
+   * 主动维护缓存，常用于在读频率非常低的情况下提供主动清理缓存中已过期数据的方法
+   */
   @Override
   public void cleanUp() {
     try {
@@ -1596,13 +1769,16 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    *
    * @param task an additional pending task to run, or {@code null} if not present
    */
+  // 清理缓存
   void performCleanUp(@Nullable Runnable task) {
     evictionLock.lock();
     try {
+      // 维护缓存
       maintenance(task);
     } finally {
       evictionLock.unlock();
     }
+    // 注意这里，缓存维护结束后会重新判断 drainStatus，如果缓冲区还需要清理那么还会走到 scheduleDrainBuffers() 方法进行清理缓存
     if ((drainStatus() == REQUIRED) && (executor == ForkJoinPool.commonPool())) {
       scheduleDrainBuffers();
     }
@@ -1615,26 +1791,47 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    *
    * @param task an additional pending task to run, or {@code null} if not present
    */
+  /**
+   * 维护缓存，需要在加锁的情况下进行
+   * 这个方法包含了对缓冲区的处理、弱引用/软引用Queue的处理、顺序读/写队列中基于时间的过期处理、基于容量的缓存驱逐处理、驱逐策略的动态调整
+   */
   @GuardedBy("evictionLock")
   void maintenance(@Nullable Runnable task) {
+
+    // 原子更新缓冲区状态，开始维护为 PROCESSING_TO_IDLE，维护结束为 IDLE
     setDrainStatusRelease(PROCESSING_TO_IDLE);
 
     try {
+      // 清理读缓冲区，读缓冲区中存储的是 node 本身
+      // 清理读缓冲区的过程主要就是将读缓冲区中的 node 进行重放，重放过程中会调用对应的策略来更新 node 在所属队列中的排序和访问频率，然后删除 node
       drainReadBuffer();
 
+      // 清理写缓冲区，写缓冲区中存储的是根据当时写操作封装出的 task，这些 task 表示写操作后需要执行的策略
+      // 清理写缓冲区的过程主要就是将写缓冲区中存储的 task 遍历执行
       drainWriteBuffer();
+
+      // 这个 task 一般是在 afterWrite() 操作中将 task 丢到 writeBuffer 失败时带过来的任务，在这里立即执行降低延迟
       if (task != null) {
         task.run();
       }
 
+      // key、value 如果使用软引用/弱引用进行包装，key/value 被JVM回收时会将 对应的 key/value 放在 referenceQueue 中
+      // Caffeine 通过监听key 和 value 的 referenceQueue 就可以得知被JVM回收的 key/value，然后移除相应的 node
+      // 清理被GC收集的 key 关联的 node
       drainKeyReferences();
+      // 清理被GC收集的 value 关联的 node
       drainValueReferences();
 
+      // 清理过期的缓存，这里用到了上面维护的几个顺序读、写队列，会按照队列中的顺序进行过期处理，直到遇到不过期的元素停止
       expireEntries();
+      // 缓存驱逐，这里体现了 W-TinyLFU 算法的思路，先
       evictEntries();
 
+      // 根据最近访问/访问频率动态调整驱逐策略，达到最佳驱逐效果
       climb();
+
     } finally {
+      // 缓存维护结束，更新缓冲状态为 IDLE
       if ((drainStatus() != PROCESSING_TO_IDLE) || !casDrainStatus(PROCESSING_TO_IDLE, IDLE)) {
         setDrainStatusOpaque(REQUIRED);
       }
@@ -1642,6 +1839,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /** Drains the weak key references queue. */
+  /**
+   * 驱逐被GC回收的弱引用包装的 key 关联的 node
+   */
   @GuardedBy("evictionLock")
   void drainKeyReferences() {
     if (!collectKeys()) {
@@ -1657,6 +1857,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /** Drains the weak / soft value references queue. */
+  /**
+   * 驱逐被GC回收的弱引用/软引用包装的 value 关联的 node
+   */
   @GuardedBy("evictionLock")
   void drainValueReferences() {
     if (!collectValues()) {
@@ -1674,22 +1877,37 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /** Drains the read buffer. */
+  /**
+   * 清理 readBuffer
+   * 对有界缓存来说，readBuffer 使用的是 {@link BoundedBuffer}，它继承了 {@link StripedBuffer} 抽象类，是带状缓冲区的实现；
+   * {@link BoundedBuffer} 内部定义了一个名为 {@link com.github.benmanes.caffeine.cache.BoundedBuffer.RingBuffer} 的内部类，
+   * 该内部类表示一个环形缓冲区，带状缓冲区的每个桶位上都是一个环形缓冲区，每个线程根据自己的 threadId 在带状缓冲区中定位到属于自己的桶位，
+   * 然后再对该桶位上的环形缓冲区进行操作，这样可以有效的减少线程竞争。
+   */
   @GuardedBy("evictionLock")
   void drainReadBuffer() {
     if (!skipReadBuffer()) {
+      // 这里将 accessPolicy 作为参数，清理 readBuffer 中每个 node 时都会调用一次 accessPolicy，用于调整 node 在对应队列中的排序
       readBuffer.drainTo(accessPolicy);
     }
   }
 
   /** Updates the node's location in the page replacement policy. */
+  /**
+   * 读取策略，用来更新 node 在所属队列中的顺序和访问频率，方便 W-TinyLFU 算法进行驱逐
+   */
   @GuardedBy("evictionLock")
   void onAccess(Node<K, V> node) {
+    // 允许驱逐
     if (evicts()) {
       K key = node.getKey();
       if (key == null) {
         return;
       }
+      // 增加 node 的访问频率
       frequencySketch().increment(key);
+
+      // 更新 node 在所属队列的排序
       if (node.inWindow()) {
         reorder(accessOrderWindowDeque(), node);
       } else if (node.inMainProbation()) {
@@ -1698,9 +1916,12 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         reorder(accessOrderProtectedDeque(), node);
       }
       setHitsInSample(hitsInSample() + 1);
-    } else if (expiresAfterAccess()) {
+    } // 过期
+    else if (expiresAfterAccess()) {
       reorder(accessOrderWindowDeque(), node);
     }
+
+    // 一段时候后过期，丢到时间轮中
     if (expiresVariable()) {
       timerWheel().reschedule(node);
     }
@@ -1736,6 +1957,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /** Drains the write buffer. */
+  /**
+   * 清理写缓冲区
+   */
   @GuardedBy("evictionLock")
   void drainWriteBuffer() {
     for (int i = 0; i <= WRITE_BUFFER_MAX; i++) {
@@ -1776,6 +2000,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /** Adds the node to the page replacement policy. */
+  /**
+   * 写操作之add的处理策略，包含以下几点
+   *
+   * 1. 策略权重、访问频率的维护
+   * 2. 将 node 按权重排序丢到 window 区域，权重大的在队首，权重小的队尾，如果自定义了过期策略，还要将 node 丢到时间轮中
+   * 3. 更新 node 的最后访问时间、最后写入时间、自定义策略的可存活时间
+   */
   final class AddTask implements Runnable {
     final Node<K, V> node;
     final int weight;
@@ -1789,6 +2020,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     @GuardedBy("evictionLock")
     @SuppressWarnings("FutureReturnValueIgnored")
     public void run() {
+      // 1. 定义了驱逐策略时，更新 node 的访问频率和权重
       if (evicts()) {
         long weightedSize = weightedSize();
         setWeightedSize(weightedSize + weight);
@@ -1810,7 +2042,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         setMissesInSample(missesInSample() + 1);
       }
 
-      // ignore out-of-order write operations
+      // node 还存活时，将 node 入队到 window 区域，如果自定义了过期策略还需要丢到时间轮中
       boolean isAlive;
       synchronized (node) {
         isAlive = node.isAlive();
@@ -1829,7 +2061,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         }
       }
 
-      // Ensure that in-flight async computation cannot expire (reset on a completion callback)
+      // 更新 node 的可存活时间、最后访问时间、最后写入时间，避免在进行异步计算时 node 过期
       if (isComputingAsync(node)) {
         synchronized (node) {
           if (!Async.isReady((CompletableFuture<?>) node.getValue())) {
@@ -1844,6 +2076,12 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /** Removes a node from the page replacement policy. */
+  /**
+   * 写操作之remove的处理策略，包含以下几点
+   *
+   * 1. 将 node 从所属的队列中/时间轮移除
+   * 2. 设置 node 状态为 dead
+   */
   final class RemovalTask implements Runnable {
     final Node<K, V> node;
 
@@ -1854,7 +2092,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     @Override
     @GuardedBy("evictionLock")
     public void run() {
-      // add may not have been processed yet
+      // 将 node 从所属的读写队列/时间轮中移除
       if (node.inWindow() && (evicts() || expiresAfterAccess())) {
         accessOrderWindowDeque().remove(node);
       } else if (evicts()) {
@@ -1869,11 +2107,19 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
       } else if (expiresVariable()) {
         timerWheel().deschedule(node);
       }
+
+      // 设置 node 状态为 dead
       makeDead(node);
     }
   }
 
   /** Updates the weighted size. */
+  /**
+   * 写操作之update的处理策略，包含以下几点
+   *
+   * 1. 更新 node 在所属读队列的顺序
+   * 2. 更新 node 在所属写队列/时间轮的顺序
+   */
   final class UpdateTask implements Runnable {
     final int weightDifference;
     final Node<K, V> node;
@@ -1886,9 +2132,12 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     @Override
     @GuardedBy("evictionLock")
     public void run() {
+
       if (evicts()) {
         int oldWeightedSize = node.getPolicyWeight();
         node.setPolicyWeight(oldWeightedSize + weightDifference);
+
+        // 1. 更新 node 在所属读队列的顺序
         if (node.inWindow()) {
           if (node.getPolicyWeight() <= windowMaximum()) {
             onAccess(node);
@@ -1919,6 +2168,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
       } else if (expiresAfterAccess()) {
         onAccess(node);
       }
+
+      // 2. 更新 node 在所属写队列/时间轮中的排序
       if (expiresAfterWrite()) {
         reorder(writeOrderDeque(), node);
       } else if (expiresVariable()) {
@@ -1944,6 +2195,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     return data.mappingCount();
   }
 
+  /**
+   * 清空整个缓存，注意这是个同步操作，可能很慢
+   *
+   * 1. 执行 writeBuffer 中所有的 task
+   * 2. 移除所有 node
+   * 3. 丢弃 readBuffer 中所有数据
+   */
   @Override
   @SuppressWarnings("FutureReturnValueIgnored")
   public void clear() {
@@ -2172,6 +2430,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     map.forEach(this::put);
   }
 
+  /**
+   * 手动 put()
+   */
   @Override
   public @Nullable V put(K key, V value) {
     return put(key, value, expiry(), /* onlyIfAbsent */ false);
@@ -2192,39 +2453,59 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    * @param onlyIfAbsent a write is performed only if the key is not already associated with a value
    * @return the prior value in or null if no mapping was found
    */
+  /**
+   * 手动 put()，expiry 表示过期策略，onlyIfAbsent 为 true 时表示当只有值为null时才put，不对原值强行覆盖
+   */
   @Nullable V put(K key, V value, Expiry<K, V> expiry, boolean onlyIfAbsent) {
     requireNonNull(key);
     requireNonNull(value);
 
+    // 本次需要 put 的 node
     Node<K, V> node = null;
     long now = expirationTicker().read();
     int newWeight = weigher.weigh(key, value);
+
+    // ============== put 操作的核心部分开始 ===============
+
+    // 自旋直到操作成功
     for (;;) {
       Node<K, V> prior = data.get(nodeFactory.newLookupKey(key));
+      // 1. 当前 node 为null
       if (prior == null) {
+        // 1.1 首先构建 node 并设置过期时间
         if (node == null) {
           node = nodeFactory.newNode(key, keyReferenceQueue(),
               value, valueReferenceQueue(), newWeight, now);
           setVariableTime(node, expireAfterCreate(key, value, expiry, now));
         }
+
+        // 1.2 将 node put 到 data
+        // 使用 putIfAbsent() 是考虑可能有其它线程也在put，避免将其它线程 put 的值强行覆盖掉
         prior = data.putIfAbsent(node.getKeyReference(), node);
+
+        // 1.2.1 返回的 prior 为 null 代表 putIfAbsent 成功，当前线程成功将 node put 到 data。执行 afterWrite() 然后返回即可
         if (prior == null) {
           afterWrite(new AddTask(node, newWeight));
           return null;
-        } else if (onlyIfAbsent) {
-          // An optimistic fast path to avoid unnecessary locking
+        } else if (onlyIfAbsent) { // onlyIfAbsent 为 true 保证了当前操作不会覆盖已有值，只会在 null 时 put
+          // 1.2.2 返回的 prior 不为 null，说明有其它线程先于当前线程 put 成功了，当前线程 put 失败
           V currentValue = prior.getValue();
+          // 如果旧值不为null且没过期则直接返回即可
           if ((currentValue != null) && !hasExpired(prior, now)) {
+            // 更新过期时间和最后访问时间
             if (!isComputingAsync(prior)) {
               tryExpireAfterRead(prior, key, currentValue, expiry(), now);
               setAccessTime(prior, now);
             }
+            // 这里需要执行 afterRead，因为虽然没有写入成功，但是进行了读取
             afterRead(prior, now, /* recordHit */ false);
             return currentValue;
           }
         }
-      } else if (onlyIfAbsent) {
-        // An optimistic fast path to avoid unnecessary locking
+      }
+
+      // 2. 当前 node 不为null，且指定 onlyIfAbsent 为 true，表示不对旧值进行覆盖，那么返回旧值即可，和上面 1.2.2 逻辑差不多
+      else if (onlyIfAbsent) {
         V currentValue = prior.getValue();
         if ((currentValue != null) && !hasExpired(prior, now)) {
           if (!isComputingAsync(prior)) {
@@ -2234,22 +2515,37 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
           afterRead(prior, now, /* recordHit */ false);
           return currentValue;
         }
-      } else {
+      }
+
+      // 走到这里说明当前已经存在值并且需要强行覆盖，那就需要加锁了；上面的步骤都是不需要加锁的，自旋重试搭配原子操作就可以了，只需要操作 data
+
+      // 3. 当前 node 不为null，且指定 onlyIfAbsent 为 false，表示强行覆盖旧值
+      else {
+        // 3.1 先丢掉当前key正在进行的自动刷新任务
         discardRefresh(prior.getKeyReference());
       }
 
+      // 3.2 强行覆盖旧值
+      // 旧值
       V oldValue;
+      // 本次操作后 node 的过期时间
       long varTime;
       int oldWeight;
+      // 旧值是否过期
       boolean expired = false;
+      // 本次操作是否会对旧值进行修改(强行覆盖旧值)
       boolean mayUpdate = true;
+      // 代表两次写操作之间的间隔是否超过了指定阈值，如果大于这个阈值就认为第二次的操作是一次单独的写操作需要执行 afterWrite()，否则第二次操作只需要执行 afterRead()
       boolean exceedsTolerance = false;
+      // 这里就必须加锁了，因为这里操作的不是 data 而是 node，ConcurrentHashMap 不能保证 node 粒度的并发安全
       synchronized (prior) {
         if (!prior.isAlive()) {
           continue;
         }
+        // 3.2.1 准备阶段，对上面定义的那些需要用到的数据进行赋值
         oldValue = prior.getValue();
         oldWeight = prior.getWeight();
+        // 这里主要就是进行驱逐通知 和 计算下次失效时间
         if (oldValue == null) {
           varTime = expireAfterCreate(key, value, expiry, now);
           notifyEviction(key, null, RemovalCause.COLLECTED);
@@ -2258,27 +2554,39 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
           varTime = expireAfterCreate(key, value, expiry, now);
           notifyEviction(key, oldValue, RemovalCause.EXPIRED);
         } else if (onlyIfAbsent) {
+          // 这里根据 onlyIfAbsent 的值来判读这次操作会不会对旧值进行修改
           mayUpdate = false;
           varTime = expireAfterRead(prior, key, value, expiry, now);
         } else {
           varTime = expireAfterUpdate(prior, key, value, expiry, now);
         }
 
+        // 3.2.2 执行强行覆盖
         if (mayUpdate) {
+          // 这里调用
           exceedsTolerance =
               (expiresAfterWrite() && (now - prior.getWriteTime()) > EXPIRE_WRITE_TOLERANCE)
-              || (expiresVariable()
-                  && Math.abs(varTime - prior.getVariableTime()) > EXPIRE_WRITE_TOLERANCE);
+              || (expiresVariable() && Math.abs(varTime - prior.getVariableTime()) > EXPIRE_WRITE_TOLERANCE);
 
+          // 更新最后写入时间和权重
           setWriteTime(prior, now);
           prior.setWeight(newWeight);
+          // 更新 node 的value
           prior.setValue(value, valueReferenceQueue());
         }
 
+        // 更新可存活时间和最后访问时间，主要用于自定义过期策略和基于最后访问时间过期中
         setVariableTime(prior, varTime);
         setAccessTime(prior, now);
       }
 
+      // ============== put 操作的核心部分结束 ===============
+
+      // 到这里说明 put 操作对 node 的写入或更新结束了，接下来就是 put 的收尾工作
+
+      // 4. 收尾工作，事件通知、执行 afterWrite() 或 afterRead()、
+
+      // 4.1 旧值过期或者为null或者被强行覆盖，触发相应的事件通知
       if (expired) {
         notifyRemoval(key, oldValue, RemovalCause.EXPIRED);
       } else if (oldValue == null) {
@@ -2287,18 +2595,23 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         notifyOnReplace(key, oldValue, value);
       }
 
+      // 4.2 执行 afterWrite() 或 afterRead()
       int weightedDifference = mayUpdate ? (newWeight - oldWeight) : 0;
+      // oldValue 为 null 或 旧值过期 或 两次写间隔超过阈值，都需要执行 afterWrite()
       if ((oldValue == null) || (weightedDifference != 0) || expired) {
         afterWrite(new UpdateTask(prior, weightedDifference));
       } else if (!onlyIfAbsent && exceedsTolerance) {
         afterWrite(new UpdateTask(prior, weightedDifference));
       } else {
+        // 执行了强行覆盖，更新最后写入时间
         if (mayUpdate) {
           setWriteTime(prior, now);
         }
+        // 到这说明两次写间隔没有超过阈值，不需要进行 afterWrite()，只要 afterRead() 即可
         afterRead(prior, now, /* recordHit */ false);
       }
 
+      // 返回旧值，如果旧值过期了就返回 null
       return expired ? null : oldValue;
     }
   }
@@ -2504,116 +2817,182 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     }
   }
 
+  /**
+   * 重写了父接口 LocalCache 的方法，LocalCache 规定了缓存的基本操作方法，子类只是实现者
+   * 缓存的获取和自动加载的核心就在这里
+   */
   @Override
-  public @Nullable V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction,
-      boolean recordStats, boolean recordLoad) {
+  public @Nullable V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction, boolean recordStats, boolean recordLoad) {
     requireNonNull(key);
     requireNonNull(mappingFunction);
+
+    // 当前基准时间，ticker 默认采用 System.nanoTime() 获取基准时间，也可以在构建缓存时自定义
     long now = expirationTicker().read();
 
-    // An optimistic fast path to avoid unnecessary locking
+    // 1. 尝试直接从 data 中快速取值，尽量避免加锁
     Node<K, V> node = data.get(nodeFactory.newLookupKey(key));
     if (node != null) {
       V value = node.getValue();
+      // data 中取到的值不为 null 且没有过期，可以直接返回 value
       if ((value != null) && !hasExpired(node, now)) {
+        // 是否异步缓存，若是同步缓存则直接同步设置过期时间和最后读取时间
         if (!isComputingAsync(node)) {
+          // 尝试更新过期时间
           tryExpireAfterRead(node, key, value, expiry(), now);
+          // 更新最后读取时间
           setAccessTime(node, now);
         }
+        // 读取操作后执行 afterRead()，并根据 afterRead() 返回的结果判断是否进行了异步刷新
         var refreshed = afterRead(node, now, /* recordHit */ recordStats);
+        // 这里根据是否异步来决定返回值，同步缓存 refreshed 表示当前值，异步缓存则 refreshed 是 future
         return (refreshed == null) ? value : refreshed;
       }
     }
+
+    // 2. data 中不存在或已过期，需要通过缓存加载器加载；这时候读操作就转换为了写操作
     if (recordStats) {
       mappingFunction = statsAware(mappingFunction, recordLoad);
     }
+    // 通过 nodeFactory 获取key，根据指定的配置这里可能会将 key 包装为软引用/弱引用
     Object keyRef = nodeFactory.newReferenceKey(key, keyReferenceQueue());
+    // 加载缓存
     return doComputeIfAbsent(key, keyRef, mappingFunction, new long[] { now }, recordStats);
   }
 
   /** Returns the current value from a computeIfAbsent invocation. */
-  @Nullable V doComputeIfAbsent(K key, Object keyRef,
-      Function<? super K, ? extends V> mappingFunction, long[/* 1 */] now, boolean recordStats) {
+  /**
+   * get(key) 失败，加载缓存
+   * 这里主要做了以下几件事：
+   * 1. 加载缓存到 data 中
+   * 2. 执行 afterRead() 或 afterWrite() 操作，将读/写事件丢到缓冲区，用于后续回放来调整 node 在各个区域的位置方便 Window-TinyLFU 算法回收
+   * 3. 如果缓冲区满了，就进行一次缓存维护操作
+   */
+  @Nullable V doComputeIfAbsent(K key, Object keyRef, Function<? super K, ? extends V> mappingFunction, long[/* 1 */] now, boolean recordStats) {
     @SuppressWarnings("unchecked")
+    // 旧值
     V[] oldValue = (V[]) new Object[1];
     @SuppressWarnings("unchecked")
+    // 新值
     V[] newValue = (V[]) new Object[1];
     @SuppressWarnings("unchecked")
+    // key
     K[] nodeKey = (K[]) new Object[1];
     @SuppressWarnings({"unchecked", "rawtypes"})
+    // 被移除的node
     Node<K, V>[] removed = new Node[1];
 
     int[] weight = new int[2]; // old, new
+    // 移除原因
     RemovalCause[] cause = new RemovalCause[1];
+
+    /**
+     * 这里调用的是 ConcurrentHashMap 的 compute() 方法，用于更新 key 对应的 value 并返回新的value
+     * compute() 会对 key 加锁
+     */
+
+    // 1. 加载缓存
+    // 这里是借助 ConcurrentHashMap 的 compute() 方法来将加载到的 node 存入 data 中的
     Node<K, V> node = data.compute(keyRef, (k, n) -> {
+      // 1.1 不存在旧值的情况，直接通过加载函数加载新的 value 并构建为新的 node 返回
       if (n == null) {
         newValue[0] = mappingFunction.apply(key);
+        // 加载函数获取的值为null，直接返回null
         if (newValue[0] == null) {
           return null;
         }
+        // 加载函数获取的值不为null，构造为 node 后返回
         now[0] = expirationTicker().read();
         weight[1] = weigher.weigh(key, newValue[0]);
-        n = nodeFactory.newNode(key, keyReferenceQueue(),
-            newValue[0], valueReferenceQueue(), weight[1], now[0]);
+        // 使用 nodeFactory 构建 key-value 为 node 节点
+        n = nodeFactory.newNode(key, keyReferenceQueue(), newValue[0], valueReferenceQueue(), weight[1], now[0]);
+        // 设置可存活时间，主要用在自定义过期策略中
         setVariableTime(n, expireAfterCreate(key, newValue[0], expiry(), now[0]));
         return n;
       }
 
+      // 1.2 旧值过期的情况，除了重新加载之外，还需要进行一些其它操作
+      // todo 这里对 node 进行加锁，原因？防止 put、evict 等操作出现并发问题吗？
       synchronized (n) {
         nodeKey[0] = n.getKey();
         weight[0] = n.getWeight();
         oldValue[0] = n.getValue();
+
+        // 1.2.1 找到移除原因并根据移除原因做一些处理
         if ((nodeKey[0] == null) || (oldValue[0] == null)) {
+          // 移除原因：垃圾收集，导致 key 和 value 都被回收了
           cause[0] = RemovalCause.COLLECTED;
         } else if (hasExpired(n, now[0])) {
+          // 移除原因：数据过期
           cause[0] = RemovalCause.EXPIRED;
         } else {
+          // 数据既没被回收也没过期，直接返回
           return n;
         }
 
+        // 数据由于 GC、过期、容量淘汰 这几种原因之一被驱逐了，需要进行驱逐通知
         if (cause[0].wasEvicted()) {
+          // todo 这里是同步调用的，为啥，不考虑下性能么？
           notifyEviction(nodeKey[0], oldValue[0], cause[0]);
         }
+
+        // 1.2.2 重新加载，并更新 node 的一些属性
         newValue[0] = mappingFunction.apply(key);
+        // 加载出的value为null，标记 node 为淘汰状态并返回 null
         if (newValue[0] == null) {
           removed[0] = n;
           n.retire();
           return null;
         }
+        // 设置 node 的值和权重
         weight[1] = weigher.weigh(key, newValue[0]);
         n.setValue(newValue[0], valueReferenceQueue());
         n.setWeight(weight[1]);
-
+        // 更新 可存活时间、最后访问时间、最后写入时间
         now[0] = expirationTicker().read();
         setVariableTime(n, expireAfterCreate(key, newValue[0], expiry(), now[0]));
         setAccessTime(n, now[0]);
         setWriteTime(n, now[0]);
+        // 取消该 node 的自动刷新操作，刚加载的不需要刷新了
         discardRefresh(k);
+
         return n;
       }
     });
 
+    // 到这里代表缓存加载完成，已经获取到最终需要返回的 node 了，当然这个 node 可能为null
+
+    // 2. 缓存加载后的一些处理，因为不是单纯的 get(key) 了，缓存加载包含了多种行为
+    // 2.1 移除事件通知
     if (cause[0] != null) {
       if (cause[0].wasEvicted()) {
         statsCounter().recordEviction(weight[0], cause[0]);
       }
+      // 这个方法会把移除事件通知封装为 task 丢到线程池中执行
       notifyRemoval(nodeKey[0], oldValue[0], cause[0]);
     }
+
+    // 2.2 compute() 返回的 node 为null，直接返回。因为这里 node 返回的是null 表示会被删除，所以 afterRead() 也就没有意义不需要了
     if (node == null) {
+      // 原节点被移除，触发 afterWrite() 操作，注意这里将是移除节点的事件封装为了 task 丢到 writeBuffer 里
       if (removed[0] != null) {
         afterWrite(new RemovalTask(removed[0]));
       }
       return null;
     }
+
+    // 2.3 加载函数加载到的 value 为 null，更新过期时间和最后访问时间
+    // todo 什么时候会走到这里呢，按理说 newValue[0] == null 则 node == null，应该在上一个判断中就 return了
     if (newValue[0] == null) {
       if (!isComputingAsync(node)) {
         tryExpireAfterRead(node, key, oldValue[0], expiry(), now[0]);
         setAccessTime(node, now[0]);
       }
-
+      // 这里返回了 oldValue，所以对于 oldValue 来说有读取操作，需要触发 afterRead()
       afterRead(node, now[0], /* recordHit */ recordStats);
       return oldValue[0];
     }
+
+    // 2.4 到这里说明加载到了值，执行 afterWrite()
     if ((oldValue[0] == null) && (cause[0] == null)) {
       afterWrite(new AddTask(node, weight[1]));
     } else {
@@ -2621,6 +3000,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
       afterWrite(new UpdateTask(node, weightedDifference));
     }
 
+    // 加载过程结束，返回 value
     return newValue[0];
   }
 
@@ -3592,6 +3972,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /** A reusable task that performs the maintenance work; used to avoid wrapping by ForkJoinPool. */
+  // 这个内部类继承自 Runnable 接口，用于执行清理缓存的任务
   static final class PerformCleanupTask extends ForkJoinTask<Void> implements Runnable {
     private static final long serialVersionUID = 1L;
 
@@ -3672,6 +4053,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
 
   /* --------------- Manual Cache --------------- */
 
+  /**
+   * 有界手动缓存
+   */
   static class BoundedLocalManualCache<K, V> implements LocalManualCache<K, V>, Serializable {
     private static final long serialVersionUID = 1;
 
@@ -3683,10 +4067,20 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
       this(builder, null);
     }
 
+    /**
+     * 初始化缓存实例
+     * LocalCacheFactory 作为缓存工厂，用来按需创建缓存实例，LocalCacheFactory 会根据指定的不同条件调用那些自动生成的类来创建缓存实例
+     * Cache 有许多不同的配置，只有使用特定功能的子集的时候，相关字段才有意义，如果默认情况下所有字段都被存在，将会导致缓存和每个缓存中的元素的内存开销的浪费。
+     * 而通过代码生成的最合理实现，将会减少运行时的内存开销但是会需要磁盘上更大的二进制文件。
+     */
     BoundedLocalManualCache(Caffeine<K, V> builder, @Nullable CacheLoader<? super K, V> loader) {
+      // 使用 LocalCacheFactory 根据配置情况按需创建缓存实例，节约内存开销
       cache = LocalCacheFactory.newBoundedLocalCache(builder, loader, /* async */ false);
     }
 
+    /**
+     * 继承自 LocalManualCache 接口，返回 cache 实例，也就是 BoundedLocalCache 动态生成的子类本身
+     */
     @Override
     public BoundedLocalCache<K, V> cache() {
       return cache;
@@ -4158,17 +4552,31 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
 
   /* --------------- Loading Cache --------------- */
 
-  static final class BoundedLocalLoadingCache<K, V>
-      extends BoundedLocalManualCache<K, V> implements LocalLoadingCache<K, V> {
+  /**
+   * 这是个有界自动加载缓存，通过继承 有界手动缓存内部类 和 自动加载缓存接口 实现
+   * 所以自动缓存实际上最终还是通过 手动缓存 来实现的
+   */
+  static final class BoundedLocalLoadingCache<K, V> extends BoundedLocalManualCache<K, V> implements LocalLoadingCache<K, V> {
     private static final long serialVersionUID = 1;
 
     final Function<K, V> mappingFunction;
     @Nullable final Function<Set<? extends K>, Map<K, V>> bulkMappingFunction;
 
+    /**
+     * 传进来的是 Caffeine 实例和 自动加载器
+     * 这里主要是根据 Caffeine 实例 和自动加载器 创建出一个真正的缓存实例
+     */
     BoundedLocalLoadingCache(Caffeine<K, V> builder, CacheLoader<? super K, V> loader) {
+      // 1. 创建 cache 实例
+      // 这里调用了 BoundedLocalManualCache 内部类的构造函数，实例化了 cache 实例
       super(builder, loader);
+
       requireNonNull(loader);
+
+      // 2. 把缓存加载器里加载函数提取出来赋值
+      // cacheLoader.load()
       mappingFunction = newMappingFunction(loader);
+      // cacheLoader.loadAll()
       bulkMappingFunction = newBulkMappingFunction(loader);
     }
 
@@ -4178,6 +4586,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
       return cache.cacheLoader;
     }
 
+    // 这个类主要的就是这个方法了，给缓存实例返回 自动加载器
     @Override
     public Function<K, V> mappingFunction() {
       return mappingFunction;
@@ -4332,18 +4741,25 @@ final class BLCHeader {
 
   /** Enforces a memory layout to avoid false sharing by padding the drain status. */
   abstract static class DrainStatusRef extends PadDrainStatus {
+    // drainStatus 属性的变量句柄，方便进行原子操作
     static final VarHandle DRAIN_STATUS;
 
+    // 缓冲区状态枚举
     /** A drain is not taking place. */
+    // 空闲
     static final int IDLE = 0;
     /** A drain is required due to a pending write modification. */
+    // 需要清理
     static final int REQUIRED = 1;
+    // 正在清理中，清理完毕后会转为 IDLE 状态
     /** A drain is in progress and will transition to idle. */
     static final int PROCESSING_TO_IDLE = 2;
     /** A drain is in progress and will transition to required. */
+    // 正在清理中，清理完毕后会转为 REQUIRED 状态
     static final int PROCESSING_TO_REQUIRED = 3;
 
     /** The draining status of the buffers. */
+    // 缓冲区状态，这里不是单指读缓冲区或写缓冲区，而是整体的状态，任意一个缓冲区满都会触发状态变更并触发缓存维护，看 scheduleDrainBuffers() 方法就知道了
     volatile int drainStatus = IDLE;
 
     /**

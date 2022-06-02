@@ -128,6 +128,7 @@ abstract class StripedBuffer<E> implements Buffer<E> {
         || ((mask = buffers.length - 1) < 0)
         || ((buffer = buffers[h & mask]) == null)
         || !(uncontended = ((result = buffer.offer(e)) != Buffer.FAILED))) {
+      // 初始化或扩容
       return expandOrRetry(e, h, increment, uncontended);
     }
     return result;
@@ -196,8 +197,10 @@ abstract class StripedBuffer<E> implements Buffer<E> {
         boolean init = false;
         try { // Initialize table
           if (table == buffers) {
+            // 创建 readBuffer，桶的初始数量为1
             @SuppressWarnings({"unchecked", "rawtypes"})
             Buffer<E>[] rs = new Buffer[1];
+            // 这里初始化第一个桶位，一个容量为16的环形缓冲区
             rs[0] = create(e);
             table = rs;
             init = true;

@@ -1050,14 +1050,23 @@ public final class Caffeine<K extends Object, V extends Object> {
    * @param <V1> the value type of the loader
    * @return a cache having the requested features
    */
+  /**
+   * 就拿这个方法作为缓存构造过程的分析入口吧
+   */
   @CheckReturnValue
-  public <K1 extends K, V1 extends V> LoadingCache<K1, V1> build(
-      CacheLoader<? super K1, V1> loader) {
+  public <K1 extends K, V1 extends V> LoadingCache<K1, V1> build(CacheLoader<? super K1, V1> loader) {
     requireWeightWithWeigher();
 
     @SuppressWarnings("unchecked")
     Caffeine<K1, V1> self = (Caffeine<K1, V1>) this;
+    // 前面进行一系列的属性设置，在这里根据前面设置的属性判断创建有界缓存还是无界缓存
     return isBounded() || refreshAfterWrite()
+        /**
+         * 就从有界缓存的创建开始看吧
+         * 1. BoundedLocalCache 类，继承了 LocalCache 接口，LocalCache 接口继承了 java.util.concurrent.ConcurrentMap 接口
+         * 2. 调用的是 BoundedLocalCache 类的内部类 BoundedLocalLoadingCache 的构造函数；把 Caffeine 这个实例作为参数传进去了，该实例包含了之前设置的一系列属性
+         * 3. 好的，那继续看 BoundedLocalLoadingCache 内部类
+         */
         ? new BoundedLocalCache.BoundedLocalLoadingCache<>(self, loader)
         : new UnboundedLocalCache.UnboundedLocalLoadingCache<>(self, loader);
   }

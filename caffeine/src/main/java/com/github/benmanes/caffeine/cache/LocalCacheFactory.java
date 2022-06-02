@@ -36,7 +36,9 @@ final class LocalCacheFactory {
   /** Returns a cache optimized for this configuration. */
   static <K, V> BoundedLocalCache<K, V> newBoundedLocalCache(Caffeine<K, V> builder,
       @Nullable AsyncCacheLoader<? super K, V> cacheLoader, boolean async) {
+    // 根据 builder 中指定的属性构造对应自动生成缓存类的类名，对于有界缓存来说该生成类继承自 BoundedLocalCache
     var className = getClassName(builder);
+    // 反射调用该类的构造函数创建缓存实例
     return loadFactory(builder, cacheLoader, async, className);
   }
 
@@ -81,8 +83,10 @@ final class LocalCacheFactory {
   static <K, V> BoundedLocalCache<K, V> loadFactory(Caffeine<K, V> builder,
       @Nullable AsyncCacheLoader<? super K, V> cacheLoader, boolean async, String className) {
     try {
+      // 找构造函数
       Class<?> clazz = Class.forName(className);
       MethodHandle handle = LOOKUP.findConstructor(clazz, FACTORY);
+      // 调用构造函数创建缓存实例，这里自动生成类的构造器中也会调用父类 BoundedLocalCache 的构造器
       return (BoundedLocalCache<K, V>) handle.invoke(builder, cacheLoader, async);
     } catch (RuntimeException | Error e) {
       throw e;

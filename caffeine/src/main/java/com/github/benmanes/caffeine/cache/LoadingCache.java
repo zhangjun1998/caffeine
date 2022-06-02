@@ -57,6 +57,7 @@ public interface LoadingCache<K extends Object, V extends Object> extends Cache<
    * @throws RuntimeException or Error if the {@link CacheLoader} does so, in which case the mapping
    *         is left unestablished
    */
+  // 就拿这个方法作为缓存获取和加载过程的分析入口吧
   V get(K key);
 
   /**

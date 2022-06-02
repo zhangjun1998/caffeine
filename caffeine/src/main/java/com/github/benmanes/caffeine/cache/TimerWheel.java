@@ -34,6 +34,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  * @author ben.manes@gmail.com (Ben Manes)
  */
 @SuppressWarnings("GuardedBy")
+// 时间轮
 final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
 
   /*
@@ -88,6 +89,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
    *
    * @param currentTimeNanos the current time, in nanoseconds
    */
+  // 执行时间轮并进行缓存驱逐，会在 BoundLocalCache 中的 maintenance() 方法中间接调用
   public void advance(long currentTimeNanos) {
     long previousTimeNanos = nanos;
     try {
@@ -120,6 +122,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
    * @param previousTicks the previous number of ticks
    * @param currentTicks the current number of ticks
    */
+  // 驱逐过期缓存
   void expire(int index, long previousTicks, long currentTicks) {
     Node<K, V>[] timerWheel = wheel[index];
     int mask = timerWheel.length - 1;
@@ -128,6 +131,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
     int start = (int) (previousTicks & mask);
     int end = start + steps;
 
+    // 遍历时间轮
     for (int i = start; i < end; i++) {
       Node<K, V> sentinel = timerWheel[i & mask];
       Node<K, V> prev = sentinel.getPreviousInVariableOrder();
@@ -135,14 +139,16 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
       sentinel.setPreviousInVariableOrder(sentinel);
       sentinel.setNextInVariableOrder(sentinel);
 
+      // 遍历当前时间轮次中的所有节点
       while (node != sentinel) {
         Node<K, V> next = node.getNextInVariableOrder();
+        // 这里解除该 node 的所有关联关系，如果不重新关联，就会被 GC 回收
         node.setPreviousInVariableOrder(null);
         node.setNextInVariableOrder(null);
 
         try {
-          if (((node.getVariableTime() - nanos) > 0)
-              || !cache.evictEntry(node, RemovalCause.EXPIRED, nanos)) {
+          // 这里判断 node 有没有过期，如果过期了就驱逐，如果没有过期或驱逐失败那么再放回时间轮等待下次轮询
+          if (((node.getVariableTime() - nanos) > 0) || !cache.evictEntry(node, RemovalCause.EXPIRED, nanos)) {
             schedule(node);
           }
           node = next;
@@ -162,6 +168,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
    *
    * @param node the entry in the cache
    */
+  // 将 node 加入到时间轮中
   public void schedule(Node<K, V> node) {
     Node<K, V> sentinel = findBucket(node.getVariableTime());
     link(sentinel, node);
@@ -172,6 +179,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
    *
    * @param node the entry in the cache
    */
+  // 从时间轮中移除 node 并重新添加
   public void reschedule(Node<K, V> node) {
     if (node.getNextInVariableOrder() != null) {
       unlink(node);
@@ -184,6 +192,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
    *
    * @param node the entry in the cache
    */
+  // 从时间轮中移除 node
   public void deschedule(Node<K, V> node) {
     unlink(node);
     node.setNextInVariableOrder(null);
@@ -196,6 +205,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
    * @param time the time when the event fires
    * @return the sentinel at the head of the bucket
    */
+  // 根据时间定位到时间轮上对应的桶位
   Node<K, V> findBucket(long time) {
     long duration = time - nanos;
     int length = wheel.length - 1;
@@ -210,6 +220,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
   }
 
   /** Adds the entry at the tail of the bucket's list. */
+  // 建立节点在时间轮中的关联关系
   void link(Node<K, V> sentinel, Node<K, V> node) {
     node.setPreviousInVariableOrder(sentinel.getPreviousInVariableOrder());
     node.setNextInVariableOrder(sentinel);
@@ -219,6 +230,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
   }
 
   /** Removes the entry from its bucket, if scheduled. */
+  // 取消节点在时间轮中的关联关系
   void unlink(Node<K, V> node) {
     Node<K, V> next = node.getNextInVariableOrder();
     if (next != null) {
@@ -430,6 +442,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
   }
 
   /** A sentinel for the doubly-linked list in the bucket. */
+  // 时间轮上每个桶位中双向链表的哨兵
   static final class Sentinel<K, V> extends Node<K, V> {
     Node<K, V> prev;
     Node<K, V> next;

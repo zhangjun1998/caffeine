@@ -25,6 +25,9 @@ import java.util.function.Consumer;
  * @author ben.manes@gmail.com (Ben Manes)
  * @param <E> the type of elements maintained by this buffer
  */
+/**
+ * 有界的带状缓冲区实现类
+ */
 final class BoundedBuffer<E> extends StripedBuffer<E> {
   /*
    * A circular ring buffer stores the elements being transferred by the producers to the consumer.
@@ -46,7 +49,9 @@ final class BoundedBuffer<E> extends StripedBuffer<E> {
    */
 
   /** The maximum number of elements per buffer. */
+  // 每个环形缓冲区的大小，16
   static final int BUFFER_SIZE = 16;
+  // 掩码，方便hash进行取余操作，(hash & MASK) 即可算出该 hash 在环形缓冲区中的位置
   static final int MASK = BUFFER_SIZE - 1;
 
   @Override
@@ -54,9 +59,15 @@ final class BoundedBuffer<E> extends StripedBuffer<E> {
     return new RingBuffer<>(e);
   }
 
+  /**
+   * 内部类，环形缓冲区
+   */
   static final class RingBuffer<E> extends BBHeader.ReadAndWriteCounterRef implements Buffer<E> {
     static final VarHandle BUFFER = MethodHandles.arrayElementVarHandle(Object[].class);
 
+    /**
+     * 环形缓冲区底层就是对象数组
+     */
     final Object[] buffer;
 
     public RingBuffer(E e) {

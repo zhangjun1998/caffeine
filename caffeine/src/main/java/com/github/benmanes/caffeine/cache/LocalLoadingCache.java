@@ -55,6 +55,8 @@ interface LocalLoadingCache<K, V> extends LocalManualCache<K, V>, LoadingCache<K
   @Override
   @SuppressWarnings("NullAway")
   default V get(K key) {
+    // cache() 被实现类 BoundedLocalCache 重写，BoundedLocalCache 的 cache() 被动态生成的子类继承，会返回动态生成子类的实例本身
+    // 调用父类接口 LocalCache 的 computeIfAbsent() 方法
     return cache().computeIfAbsent(key, mappingFunction());
   }
 
