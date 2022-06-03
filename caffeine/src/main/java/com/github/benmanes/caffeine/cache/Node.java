@@ -23,14 +23,26 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 import com.github.benmanes.caffeine.cache.AccessOrderDeque.AccessOrder;
 import com.github.benmanes.caffeine.cache.WriteOrderDeque.WriteOrder;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
+import com.github.benmanes.caffeine.cache.TimerWheel.Sentinel;
 
 /**
+ * 用于包装 value，是实际存储到 ConcurrentHashMap 中的元素，
+ * 它的主要作用就是给 value 附加一些额外的属性，方便实现 Caffeine 的功能特性，类似于装饰器(Wrapper) 模式的作用。
+ * <p>
+ * 注意：Node 中没有定义任何属性，因为不同缓存类型拥有的属性也不完全相同，如果建立一个包含所有属性的 Node 类无疑会导致资源浪费，
+ * 因此实际运行中 Caffeine 会根据缓存配置区按需动态生成代码，不同缓存类型中存储的实际上是 Node 的不同子类实现，
+ * 这些子类只包含当前缓存所需的属性，以最大化节省 node 占据的空间
+ * 可以在 debug 的时候看到，如名为『FSA』 的类
+ * <p>
+ *
  * An entry in the cache containing the key, value, weight, access, and write metadata. The key
  * or value may be held weakly or softly requiring identity comparison.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  */
 abstract class Node<K, V> implements AccessOrder<Node<K, V>>, WriteOrder<Node<K, V>> {
+
+  /* --------------- 下面部分是 key-value 及其引用类型相关方法，主要是 getter/setter --------------- */
 
   /** Return the key or {@code null} if it has been reclaimed by the garbage collector. */
   @Nullable
@@ -41,6 +53,8 @@ abstract class Node<K, V> implements AccessOrder<Node<K, V>>, WriteOrder<Node<K,
    * strongly held or a {@link java.lang.ref.WeakReference} to that key.
    */
   public abstract Object getKeyReference();
+
+  // 这里没定义 keyReference 的 setter 方法，但它的子实现类
 
   /** Return the value or {@code null} if it has been reclaimed by the garbage collector. */
   @Nullable
@@ -65,6 +79,7 @@ abstract class Node<K, V> implements AccessOrder<Node<K, V>>, WriteOrder<Node<K,
    */
   public abstract boolean containsValue(Object value);
 
+  // 权重相关
   /** Returns the weight of this entry from the entry's perspective. */
   @NonNegative
   @GuardedBy("this")
@@ -87,7 +102,7 @@ abstract class Node<K, V> implements AccessOrder<Node<K, V>>, WriteOrder<Node<K,
   // @GuardedBy("evictionLock")
   public void setPolicyWeight(@NonNegative int weight) {}
 
-  /* --------------- Health --------------- */
+  /* --------------- 下面这部分是 node 的生命周期 --------------- */
 
   /** If the entry is available in the hash-table and page replacement policy. */
   public abstract boolean isAlive();
@@ -111,7 +126,7 @@ abstract class Node<K, V> implements AccessOrder<Node<K, V>>, WriteOrder<Node<K,
   @GuardedBy("this")
   public abstract void die();
 
-  /* --------------- Variable order --------------- */
+  /* --------------- 下面这部分是 node 的最后读时间相关 --------------- */
 
   /** Returns the variable expiration time, in nanoseconds. */
   public long getVariableTime() {
@@ -132,6 +147,7 @@ abstract class Node<K, V> implements AccessOrder<Node<K, V>>, WriteOrder<Node<K,
     throw new UnsupportedOperationException();
   }
 
+  // node 在读队列中的排序相关操作
   // @GuardedBy("evictionLock")
   public Node<K, V> getPreviousInVariableOrder() {
     throw new UnsupportedOperationException();
@@ -152,8 +168,12 @@ abstract class Node<K, V> implements AccessOrder<Node<K, V>>, WriteOrder<Node<K,
     throw new UnsupportedOperationException();
   }
 
-  /* --------------- Access order --------------- */
+  /* --------------- 下面这部分是 node 的最后写时间相关 --------------- */
 
+  /**
+   * node 所在的区域，和 W-TinyLFU 算法结合理解
+   * {@link BoundedLocalCache#accessOrderWindowDeque()}、{@link BoundedLocalCache#accessOrderProbationDeque()}、{@link BoundedLocalCache#accessOrderProtectedDeque()}
+   */
   public static final int WINDOW = 0;
   public static final  int PROBATION = 1;
   public static final  int PROTECTED = 2;
@@ -233,7 +253,7 @@ abstract class Node<K, V> implements AccessOrder<Node<K, V>>, WriteOrder<Node<K,
     throw new UnsupportedOperationException();
   }
 
-  /* --------------- Write order --------------- */
+  /* --------------- 下面这部分是 node 的最后写时间相关 --------------- */
 
   /** Returns the time that this entry was last written, in ns. */
   public long getWriteTime() {
@@ -278,6 +298,9 @@ abstract class Node<K, V> implements AccessOrder<Node<K, V>>, WriteOrder<Node<K,
     throw new UnsupportedOperationException();
   }
 
+  /**
+   * 还重写了 toString() 方法
+   */
   @Override
   @SuppressWarnings("GuardedBy")
   public final String toString() {

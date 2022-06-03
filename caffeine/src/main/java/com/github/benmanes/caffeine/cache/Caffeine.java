@@ -50,6 +50,9 @@ import com.google.errorprone.annotations.CheckReturnValue;
 import com.google.errorprone.annotations.FormatMethod;
 
 /**
+ * 缓存构造器，构造器模式？
+ * <p>
+ *
  * A builder of {@link Cache}, {@link LoadingCache}, {@link AsyncCache}, and
  * {@link AsyncLoadingCache} instances having a combination of the following features:
  * <ul>
@@ -138,42 +141,81 @@ import com.google.errorprone.annotations.FormatMethod;
  *     #removalListener}
  */
 public final class Caffeine<K extends Object, V extends Object> {
+
+  /* --------------------------- 下面是一些常量和枚举的定义 ----------------------------------- */
+
+  // 用来进行缓存统计的，暂不关注
   static final Supplier<StatsCounter> ENABLED_STATS_COUNTER_SUPPLIER = ConcurrentStatsCounter::new;
   static final Logger logger = System.getLogger(Caffeine.class.getName());
+
+  // ConcurrentHashMap的默认加载因子
   static final double DEFAULT_LOAD_FACTOR = 0.75;
 
+  // key-vlaue 的引用类型枚举；其中 key 只能被 weak 包装，value 可以被 weak 和 soft 包装
   enum Strength { WEAK, SOFT }
+
+  // -1 表示未设置
   static final int UNSET_INT = -1;
 
+  // 缓存的默认大小
   static final int DEFAULT_INITIAL_CAPACITY = 16;
+  // 默认过期时间，0表示不过期
   static final int DEFAULT_EXPIRATION_NANOS = 0;
+  // 默认自动刷新时间，0表示不自动刷新
   static final int DEFAULT_REFRESH_NANOS = 0;
 
   boolean strictParsing = true;
   boolean interner;
 
+  /*---------------------------------------下面是缓存的一些属性------------------------------------------*/
+
+  // 最大容量，当元素数量超过最大容量时就会进行缓存驱逐；默认不做限制(最终还是会受到 ConcurrentHashMap 的限制，不得超过 1<<30)
   long maximumSize = UNSET_INT;
+  // 最大权重，当所有元素的权重总和超过最大权重时就会进行缓存驱逐；默认不做限制；容量和权重不能同时设置
   long maximumWeight = UNSET_INT;
+  // 初始化容量，默认无
   int initialCapacity = UNSET_INT;
 
+  // 最后一次写之后多长时间过期
   long expireAfterWriteNanos = UNSET_INT;
+  // 最后一次访问(读|写)之后多长时间过期
   long expireAfterAccessNanos = UNSET_INT;
+  // 最后一次写后多长时间自动刷新
   long refreshAfterWriteNanos = UNSET_INT;
 
+  // 下面这些没有默认值的属性，它们的 getter 方法会在为 null 时返回默认值
+
+  // 驱逐事件监听器
   @Nullable RemovalListener<? super K, ? super V> evictionListener;
+  // 移除事件监听器
   @Nullable RemovalListener<? super K, ? super V> removalListener;
+  // 用于缓存状态统计的，暂不关注
   @Nullable Supplier<StatsCounter> statsCounterSupplier;
+  // 权重算法
   @Nullable Weigher<? super K, ? super V> weigher;
+  // 过期策略
   @Nullable Expiry<? super K, ? super V> expiry;
+  // 调度器
   @Nullable Scheduler scheduler;
+  // 线程池，默认使用
   @Nullable Executor executor;
+  // 用来提供基准时间的时间源
   @Nullable Ticker ticker;
 
+  // key 的引用强度
   @Nullable Strength keyStrength;
+  // value 的引用强度
   @Nullable Strength valueStrength;
 
+  /*---------------------------------------私有构造函数-------------------------------------------*/
+
+  /**
+   * 私有的默认构造函数，只提供给 Caffeine 内部进行调用；
+   * 无参构造函数，默认上面所有的属性都是默认值
+   */
   private Caffeine() {}
 
+  /*----------------------------------一些校验函数，用在链式方法的参数校验上-------------------------------------*/
   /** Ensures that the argument expression is true. */
   @FormatMethod
   static void requireArgument(boolean expression, String template, @Nullable Object... args) {
@@ -203,6 +245,8 @@ public final class Caffeine<K extends Object, V extends Object> {
       throw new IllegalStateException(String.format(template, args));
     }
   }
+
+  /*-----------------------------------一些静态方法-----------------------------------------*/
 
   /** Returns the smallest power of two greater than or equal to {@code x}. */
   static int ceilingPowerOfTwo(int x) {
@@ -240,7 +284,13 @@ public final class Caffeine<K extends Object, V extends Object> {
         : /* DEFAULT_INITIAL_CAPACITY */ 16;
   }
 
+  // ================= 下面这些静态方法比较重要 =================
+
   /**
+   * 返回一个默认的缓存构造器，不设置任何属性，其实就是调用 Caffeine 的无参构造函数，
+   * 主要就是作为一个入口，返回 Caffeine 实例，方便进行链式调用
+   * <p>
+   *
    * Constructs a new {@code Caffeine} instance with default settings, including strong keys, strong
    * values, and no automatic eviction of any kind.
    * <p>
@@ -286,7 +336,15 @@ public final class Caffeine<K extends Object, V extends Object> {
     return from(CaffeineSpec.parse(spec));
   }
 
+  /*-----------------------------------一些可以链式调用的方法，主要用来初始化上面的那些缓存属性-----------------------------------------*/
+
+  // ========================== 线程池相关 =====================
+
   /**
+   * 设置缓存的初始化容量，
+   * 在缓存容量变动不频繁或可以确定缓存使用量的情况下很有用，可以减少 Map 的扩容次数
+   * <p>
+   *
    * Sets the minimum total size for the internal data structures. Providing a large enough estimate
    * at construction time avoids the need for expensive resizing operations later, but setting this
    * value unnecessarily high wastes memory.
@@ -313,6 +371,10 @@ public final class Caffeine<K extends Object, V extends Object> {
   }
 
   /**
+   * 设置线程池，默认使用的是 {@link ForkJoinPool#commonPool}，默认使用它的目的主要是 Caffeine 的计算比较多，这个线程池会采取分治的思维去执行任务，
+   * 主要用在一些需要异步执行的地方，比如移除事件通知、异步加载等，没有特殊需要使用默认的就好了。
+   * <p>
+   *
    * Specifies the executor to use when running asynchronous tasks. The executor is delegated to
    * when sending removal notifications, when asynchronous computations are performed by
    * {@link AsyncCache} or {@link LoadingCache#refresh} or {@link #refreshAfterWrite}, or when
@@ -375,7 +437,12 @@ public final class Caffeine<K extends Object, V extends Object> {
     return Scheduler.guardedScheduler(scheduler);
   }
 
+  // ======================== 容量相关的方法，主要是容量和权重及权重策略 ===================
+
   /**
+   * 指定缓存的最大容量，不指定的时候默认不限制最大容量
+   * <p>
+   *
    * Specifies the maximum number of entries the cache may contain. Note that the cache <b>may evict
    * an entry before this limit is exceeded or temporarily exceed the threshold while evicting</b>.
    * As the cache size grows close to the maximum, the cache evicts entries that are less likely to
@@ -406,6 +473,11 @@ public final class Caffeine<K extends Object, V extends Object> {
   }
 
   /**
+   * 指定最大权重，当所有元素的权重总和超过最大权重时就会进行缓存驱逐，
+   * 不指定的时候默认不限制权重，
+   * 不能和 {@link #maximumSize(long)} 一起使用。
+   * <p>
+   *
    * Specifies the maximum weight of entries the cache may contain. Weight is determined using the
    * {@link Weigher} specified with {@link #weigher}, and use of this method requires a
    * corresponding call to {@link #weigher} prior to calling {@link #build}.
@@ -441,6 +513,9 @@ public final class Caffeine<K extends Object, V extends Object> {
   }
 
   /**
+   * 自定义权重策略，一般用不到
+   * <p>
+   *
    * Specifies the weigher to use in determining the weight of entries. Entry weight is taken into
    * consideration by {@link #maximumWeight(long)} when determining which entries to evict, and use
    * of this method requires a corresponding call to {@link #maximumWeight(long)} prior to calling
@@ -503,7 +578,13 @@ public final class Caffeine<K extends Object, V extends Object> {
     return isAsync ? (Weigher<K1, V1>) new AsyncWeigher(delegate) : delegate;
   }
 
+  // ======================== key-value 相关的方法，主要就是 key-value 的引用包装 ===================
+
   /**
+   * 对 key 使用 弱引用进行包装，主要是限制内存的占用，避免因为 Caffeine 内存占用过多导致 OOM。
+   * 在垃圾收集的时候会将弱引用包装的 key 回收，此后从 Caffeine 中 get 的时候不会再返回，尽量不要用，实在要用就用 {@link #softValues()} 方法
+   * <p>
+   *
    * Specifies that each key (not value) stored in the cache should be wrapped in a
    * {@link WeakReference} (by default, strong references are used).
    * <p>
@@ -533,6 +614,10 @@ public final class Caffeine<K extends Object, V extends Object> {
   }
 
   /**
+   * 对 value 进行弱引用包装，这会导致如果缓存的 value 没有与其它的强引用关联就会被GC直接回收，
+   * 如果只想避免因为缓存导致OOM，尽量用 {@link #softValues()} 方法代替
+   * <p>
+   *
    * Specifies that each value (not key) stored in the cache should be wrapped in a
    * {@link WeakReference} (by default, strong references are used).
    * <p>
@@ -593,7 +678,13 @@ public final class Caffeine<K extends Object, V extends Object> {
     return this;
   }
 
+  // ==============================过期时间相关====================================
+
   /**
+   * 指定在最后一次写之后多长时间过期。
+   * 内部进行缓存维护的时候会自动删除过期数据，即使还没来的及删除，在 get 的时候也会进行校验不会读到过期数据。
+   * <p>
+   *
    * Specifies that each entry should be automatically removed from the cache once a fixed duration
    * has elapsed after the entry's creation, or the most recent replacement of its value.
    * <p>
@@ -650,6 +741,9 @@ public final class Caffeine<K extends Object, V extends Object> {
   }
 
   /**
+   * 指定在最后一次访问(读|写)后多长时间过期
+   * <p>
+   *
    * Specifies that each entry should be automatically removed from the cache once a fixed duration
    * has elapsed after the entry's creation, the most recent replacement of its value, or its last
    * access. Access time is reset by all cache read and write operations (including {@code
@@ -712,6 +806,9 @@ public final class Caffeine<K extends Object, V extends Object> {
   }
 
   /**
+   * 自定义过期策略
+   * <p>
+   *
    * Specifies that each entry should be automatically removed from the cache once a duration has
    * elapsed after the entry's creation, the most recent replacement of its value, or its last
    * read. The expiration time is reset by all cache read and write operations (including
@@ -764,7 +861,13 @@ public final class Caffeine<K extends Object, V extends Object> {
         : (Expiry<K, V>) expiry;
   }
 
+  // =================================== 自动刷新相关 =====================================
+
   /**
+   * 指定最后一次写操作后多长时间进行自动刷新
+   * 注意：自动刷新不是到时间就立即刷新，而是需要读操作触发，在第一次读取到过期数据时会进行异步刷新，刷新完成前返回的是旧值
+   * <p>
+   *
    * Specifies that active entries are eligible for automatic refresh once a fixed duration has
    * elapsed after the entry's creation, or the most recent replacement of its value. The semantics
    * of refreshes are specified in {@link LoadingCache#refresh}, and are performed by calling
@@ -828,7 +931,13 @@ public final class Caffeine<K extends Object, V extends Object> {
     return refreshAfterWriteNanos != UNSET_INT;
   }
 
+  // ===================================== 时间源相关 ====================================
+
   /**
+   * 指定时间源，时间源返回当前的纳秒数，默认使用 {@link System#nanoTime()}，
+   * 主要用在过期和自动刷新的时间判断上
+   * <p>
+   *
    * Specifies a nanosecond-precision time source for use in determining when entries should be
    * expired or refreshed. By default, {@link System#nanoTime} is used.
    * <p>
@@ -854,7 +963,15 @@ public final class Caffeine<K extends Object, V extends Object> {
         : Ticker.disabledTicker();
   }
 
+  // ===================================== 事件通知相关 ====================================
+
   /**
+   * 指定驱逐事件的回调方法，每个元素被驱逐时都会触发一次回调。
+   * 驱逐事件的回调是同步的，注意性能问题。
+   * <p>
+   * 注意：这个方法返回的 Caffeine 实例改变了泛型定义，因此使用这个方法后不要再用原来的 Caffeine 实例了，使用本次返回的实例
+   * <p>
+   *
    * Specifies a listener instance that caches should notify each time an entry is evicted. The
    * cache will invoke this listener during the atomic operation to remove the entry. In the case of
    * expiration or reference collection, the entry may be pending removal and will be discarded as
@@ -909,6 +1026,12 @@ public final class Caffeine<K extends Object, V extends Object> {
   }
 
   /**
+   * 指定移除事件的回调方法，每个元素被移除时都会触发一次回调，
+   * 这个回调方法会丢到线程池异步执行。
+   * <p>
+   * 注意：这个方法返回的 Caffeine 实例改变了泛型定义，因此使用这个方法后不要再用原来的 Caffeine 实例了，使用本次返回的实例
+   * <p>
+   *
    * Specifies a listener instance that caches should notify each time an entry is removed for any
    * {@linkplain RemovalCause reason}. The cache will invoke this listener on the configured
    * {@link #executor(Executor)} after the entry's removal operation has completed. In the case of
@@ -957,6 +1080,8 @@ public final class Caffeine<K extends Object, V extends Object> {
         ? new AsyncRemovalListener(castedListener, getExecutor())
         : castedListener;
   }
+
+  // ===================================== 缓存统计相关 ====================================
 
   /**
    * Enables the accumulation of {@link CacheStats} during the operation of the cache. Without this
@@ -1009,6 +1134,8 @@ public final class Caffeine<K extends Object, V extends Object> {
         || (valueStrength != null);
   }
 
+  // ===================================== 缓存实例的构造方法 ====================================
+
   /**
    * Builds a cache which does not automatically load values when keys are requested unless a
    * mapping function is provided. Note that multiple threads can concurrently load values for
@@ -1037,6 +1164,8 @@ public final class Caffeine<K extends Object, V extends Object> {
   }
 
   /**
+   * 构建缓存实例
+   *
    * Builds a cache, which either returns an already-loaded value for a given key or atomically
    * computes or retrieves it using the supplied {@code CacheLoader}. If another thread is currently
    * loading the value for this key, simply waits for that thread to finish and returns its loaded
@@ -1049,9 +1178,6 @@ public final class Caffeine<K extends Object, V extends Object> {
    * @param <K1> the key type of the loader
    * @param <V1> the value type of the loader
    * @return a cache having the requested features
-   */
-  /**
-   * 就拿这个方法作为缓存构造过程的分析入口吧
    */
   @CheckReturnValue
   public <K1 extends K, V1 extends V> LoadingCache<K1, V1> build(CacheLoader<? super K1, V1> loader) {
