@@ -23,6 +23,9 @@ import java.util.NoSuchElementException;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
+ * 顺序队列抽象类，给顺序访问队列和顺序写队列提供骨架
+ * <p>
+ *
  * This class provides a skeletal implementation of the {@link LinkedDeque} interface to minimize
  * the effort required to implement this interface.
  *

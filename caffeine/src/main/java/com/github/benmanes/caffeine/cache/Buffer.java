@@ -41,6 +41,9 @@ interface Buffer<E> {
   }
 
   /**
+   * 添加元素到缓冲区，多线程并发情况下使用 CAS 保证操作安全，CAS 操作失败的插入失败
+   * <p>
+   *
    * Inserts the specified element into this buffer if it is possible to do so immediately without
    * violating capacity restrictions. The addition is allowed to fail spuriously if multiple
    * threads insert concurrently.
@@ -51,6 +54,9 @@ interface Buffer<E> {
   int offer(E e);
 
   /**
+   * 清理缓冲区，每个元素都会被 consumer 消费一次，调用方必须保证线程安全
+   * <p>
+   *
    * Drains the buffer, sending each element to the consumer for processing. The caller must ensure
    * that a consumer has exclusive read access to the buffer.
    *

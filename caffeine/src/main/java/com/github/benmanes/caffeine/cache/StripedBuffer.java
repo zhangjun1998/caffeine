@@ -30,6 +30,9 @@ import java.util.function.Consumer;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
+ * 带状缓冲区的抽象类，提供了一些带状缓冲区的基本方法
+ * <p>
+ *
  * A base class providing the mechanics for supporting dynamic striping of bounded buffers. This
  * implementation is an adaption of the numeric 64-bit {@link java.util.concurrent.atomic.Striped64}
  * class, which is used by atomic counters. The approach was modified to lazily grow an array of
@@ -85,19 +88,29 @@ abstract class StripedBuffer<E> implements Buffer<E> {
 
   static final VarHandle TABLE_BUSY;
 
-  /** Number of CPUS. */
+  /**
+   * 当前服务器的 CPU 数量
+   */
   static final int NCPU = Runtime.getRuntime().availableProcessors();
 
-  /** The bound on the table size. */
+  /**
+   * 带状缓冲区的最大容量，取决于 CPU 数量
+   */
   static final int MAXIMUM_TABLE_SIZE = 4 * ceilingPowerOfTwo(NCPU);
 
-  /** The maximum number of attempts when trying to expand the table. */
+  /**
+   * 扩容操作的最大重试次数
+   */
   static final int ATTEMPTS = 3;
 
-  /** Table of buffers. When non-null, size is a power of 2. */
+  /**
+   * 带状缓冲区大小，2的n次幂
+   */
   volatile Buffer<E> @Nullable[] table;
 
-  /** Spinlock (locked via CAS) used when resizing and/or creating Buffers. */
+  /**
+   * 操作 缓冲区的 CAS 标记，在初始化缓冲区和调节缓冲区大小时会使用其进行自旋
+   */
   volatile int tableBusy;
 
   /** CASes the tableBusy field from 0 to 1 to acquire lock. */
@@ -113,6 +126,9 @@ abstract class StripedBuffer<E> implements Buffer<E> {
    */
   protected abstract Buffer<E> create(E e);
 
+  /**
+   * 向缓冲区中添加元素
+   */
   @Override
   public int offer(E e) {
     long z = mix64(Thread.currentThread().getId());
@@ -124,11 +140,14 @@ abstract class StripedBuffer<E> implements Buffer<E> {
     Buffer<E> buffer;
     boolean uncontended = true;
     Buffer<E>[] buffers = table;
+
+    // buffer.offer(e) 调用的是 RingBuffer 的 offer() 方法，内部使用 CAS 来添加元素
     if ((buffers == null)
         || ((mask = buffers.length - 1) < 0)
         || ((buffer = buffers[h & mask]) == null)
         || !(uncontended = ((result = buffer.offer(e)) != Buffer.FAILED))) {
-      // 初始化或扩容
+
+      // 添加到缓冲区失败，进行扩容避免线程竞争
       return expandOrRetry(e, h, increment, uncontended);
     }
     return result;
@@ -216,14 +235,20 @@ abstract class StripedBuffer<E> implements Buffer<E> {
     return result;
   }
 
+  /**
+   * 清理缓冲区，BoundedBuffer 继承了该方法，会遍历清理所有的环形缓冲区
+   */
   @Override
   public void drainTo(Consumer<E> consumer) {
+    // 带状缓冲区实例
     Buffer<E>[] buffers = table;
     if (buffers == null) {
       return;
     }
+    // 遍历清理带状缓冲区中的所有环形缓冲区
     for (Buffer<E> buffer : buffers) {
       if (buffer != null) {
+        // 这里调用的是 RingBuffer 的 drainTo() 方法
         buffer.drainTo(consumer);
       }
     }

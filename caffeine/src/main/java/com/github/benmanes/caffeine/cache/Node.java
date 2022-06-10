@@ -91,7 +91,7 @@ abstract class Node<K, V> implements AccessOrder<Node<K, V>>, WriteOrder<Node<K,
   @GuardedBy("this")
   public void setWeight(@NonNegative int weight) {}
 
-  /** Returns the weight of this entry from the policy's perspective. */
+  /** returns the weight of this entry from the policy's perspective. */
   @NonNegative
   // @GuardedBy("evictionLock")
   public int getPolicyWeight() {

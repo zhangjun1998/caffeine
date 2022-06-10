@@ -22,6 +22,11 @@ import java.util.AbstractQueue;
 import java.util.Iterator;
 
 /**
+ * 写缓冲区。
+ * 它是一个可自动扩容的数组，扩展时它不会像 hashmap 那样把旧数组的元素复制到新的数组，而是用一个 link 来连接到新的数组，
+ * 它融合了链表和数组，既可以动态变化长度，又不会像链表一样需要频繁分配 Node，并且吞吐量优于传统的链表。
+ * <p>
+ *
  * An MPSC array queue which starts at <i>initialCapacity</i> and grows to <i>maxCapacity</i> in
  * linked chunks of the initial size. The queue grows only when the current buffer is full and
  * elements are not copied on resize, instead a link to the new buffer is stored in the old buffer
@@ -35,6 +40,9 @@ import java.util.Iterator;
 class MpscGrowableArrayQueue<E> extends MpscChunkedArrayQueue<E> {
 
   /**
+   * 构造函数，传入的参数在 {@link BoundedLocalCache} 中写死了。
+   * 初始容量为{@link BoundedLocalCache#WRITE_BUFFER_MIN}，最大容量为{@link BoundedLocalCache#WRITE_BUFFER_MAX}
+   *
    * @param initialCapacity the queue initial capacity. If chunk size is fixed this will be the
    *        chunk size. Must be 2 or more.
    * @param maxCapacity the maximum capacity will be rounded up to the closest power of 2 and will
@@ -107,7 +115,9 @@ abstract class MpscChunkedArrayQueue<E> extends MpscChunkedArrayQueueColdProduce
 abstract class MpscChunkedArrayQueueColdProducerFields<E> extends BaseMpscLinkedArrayQueue<E> {
   protected final long maxQueueCapacity;
 
+  // 子类中会链式调用父类构造函数
   MpscChunkedArrayQueueColdProducerFields(int initialCapacity, int maxCapacity) {
+    // 调用父类构造函数，初始化 buffer
     super(initialCapacity);
     if (maxCapacity < 4) {
       throw new IllegalArgumentException("Max capacity must be 4 or more");
@@ -116,6 +126,7 @@ abstract class MpscChunkedArrayQueueColdProducerFields<E> extends BaseMpscLinked
       throw new IllegalArgumentException(
           "Initial capacity cannot exceed maximum capacity(both rounded up to a power of 2)");
     }
+    // 设置最大容量为2^n * 2，其中2^n是大于 maxCapacity 的最小值
     maxQueueCapacity = ((long) ceilingPowerOfTwo(maxCapacity)) << 1;
   }
 }
@@ -163,8 +174,11 @@ abstract class BaseMpscLinkedArrayQueuePad2<E> extends BaseMpscLinkedArrayQueueP
 
 @SuppressWarnings("NullAway")
 abstract class BaseMpscLinkedArrayQueueConsumerFields<E> extends BaseMpscLinkedArrayQueuePad2<E> {
+  // 消费者 buffer 的掩码，用于快速根据 offset 确定消费者的下标
   protected long consumerMask;
+  // 消费者 buffer，实际指向的是和 producerBuffer 共同的数组
   protected E[] consumerBuffer;
+  // 消费者当前下标
   protected long consumerIndex;
 }
 
@@ -190,8 +204,11 @@ abstract class BaseMpscLinkedArrayQueuePad3<E> extends BaseMpscLinkedArrayQueueC
 @SuppressWarnings("NullAway")
 abstract class BaseMpscLinkedArrayQueueColdProducerFields<E>
     extends BaseMpscLinkedArrayQueuePad3<E> {
+  // 生产者的最大下标
   protected volatile long producerLimit;
+  // 数组掩码，用于快速确定下标，index = offset & mask
   protected long producerMask;
+  // 生产者的 buffer，实际指向的是和 consumerBuffer 共同的数组
   protected E[] producerBuffer;
 }
 
@@ -237,6 +254,14 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
     return getClass().getName() + "@" + Integer.toHexString(hashCode());
   }
 
+  /**
+   * <ol>
+   *     <li>死循环，直到写入成功</li>
+   *     <li>生产者的位置 > 限制值，需要进行扩容或者重试等</li>
+   *     <li>生产者的位置 < 限制值，允许添加元素，更新生产者的位置</li>
+   *     <li>若更新生产者位置成功，在数组指定位置设置元素值</li>
+   * </ol>
+   */
   @Override
   @SuppressWarnings("MissingDefault")
   public boolean offer(final E e) {
@@ -248,10 +273,12 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
     E[] buffer;
     long pIndex;
 
+    // 死循环，直到写入成功
     while (true) {
       long producerLimit = lvProducerLimit();
+      // 获取 producerIndex，保证可见性
       pIndex = lvProducerIndex(this);
-      // lower bit is indicative of resize, if we see it we spin until it's cleared
+      // producerIndex 的最低位等于1，表示在进行扩容，空转等待扩容结束
       if ((pIndex & 1) == 1) {
         continue;
       }
@@ -263,7 +290,10 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
       // a successful CAS ties the ordering, lv(pIndex)-[mask/buffer]->cas(pIndex)
 
       // assumption behind this optimization is that queue is almost always empty or near empty
+
+      // 1. 生产者的位置 > 限制值，需要进行扩容或者重试等
       if (producerLimit <= pIndex) {
+        // 通过 offerSlowPath() 判断应进行何种操作，0-，1-重试，2-，3-扩容
         int result = offerSlowPath(mask, pIndex, producerLimit);
         switch (result) {
           case 0:
@@ -278,13 +308,21 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
         }
       }
 
+      // 2. 生产者的位置 < 限制值，允许添加元素，更新生产者的位置
+      // CAS 原子更新 producerIndex，若成功说明可以该线程可以对 producerIndex 在数组中对应的下标元素进行操作，这样还不阻塞下一个线程执行
       if (casProducerIndex(this, pIndex, pIndex + 2)) {
         break;
       }
     }
-    // INDEX visible before ELEMENT, consistent with consumer expectation
+
+    // 3. 若更新生产者位置成功，在数组指定位置设置元素值
+    // 这里没有通过追加的方式添加，而是通过操作指定下标的元素，以此配合CAS来避免多线程竞争数组的相同下标位置
+
+    // 根据 producerIndex 定位当前线程可以操作的数组下标位置
     final long offset = modifiedCalcElementOffset(pIndex, mask);
+    // 设置指定数组下标位置上的元素为 e
     soElement(buffer, offset, e);
+
     return true;
   }
 
@@ -319,10 +357,14 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
    */
   protected abstract long availableInQueue(long pIndex, final long cIndex);
 
+
   /**
-   * {@inheritDoc}
-   * <p>
-   * This implementation is correct for single consumer thread use only.
+   * <ol>
+   *     <li>根据 consumerIndex 计算 offset，加载指定位置的元素e</li>
+   *     <li>若 e ==null，判断是继续读取还是终止</li>
+   *     <li>若 e == JUMP，跳到下一个数组继续读</li>
+   *     <li>释放空间并更新消费者的位置</li>
+   * </ol>
    */
   @Override
   @SuppressWarnings("unchecked")
@@ -331,9 +373,13 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
     final long index = consumerIndex;
     final long mask = consumerMask;
 
+    // 1. 根据 consumerIndex 计算 offset，加载指定位置的元素
     final long offset = modifiedCalcElementOffset(index, mask);
     Object e = lvElement(buffer, offset);// LoadLoad
+
+    // 2. e ==null，一般不会发生
     if (e == null) {
+      // 还没有读到 producerIndex 的位置，说明是延迟写入，继续读取即可
       if (index != lvProducerIndex(this)) {
         // poll() == null iff queue is empty, null element is not strong enough indicator, so we
         // must check the producer index. If the queue is indeed not empty we spin until element is
@@ -341,16 +387,26 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
         do {
           e = lvElement(buffer, offset);
         } while (e == null);
-      } else {
+      }
+      // 已经读到了 producerIndex 的位置，说明数据读完了，停止
+      else {
         return null;
       }
     }
+
+    // 3. e == JUMP，跳到下一个数组继续读
     if (e == JUMP) {
       final E[] nextBuffer = getNextBuffer(buffer, mask);
       return newBufferPoll(nextBuffer, index);
     }
+
+    // 4. 释放空间并更新消费者位置
+    // 将读过的下标置为null，释放空间
     soElement(buffer, offset, null);
+    // 更新 consumerIndex
     soConsumerIndex(this, index + 2);
+
+    // 返回元素
     return (E) e;
   }
 

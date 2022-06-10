@@ -248,7 +248,17 @@ public final class Caffeine<K extends Object, V extends Object> {
 
   /*-----------------------------------一些静态方法-----------------------------------------*/
 
-  /** Returns the smallest power of two greater than or equal to {@code x}. */
+
+  /**
+   * 在保证 2^n >= x 成立的情况下，返回 2^n 的最小值，保证是2的n次幂
+   * 如 x==100，则 n >= 7，2^n >= 128，返回128。
+   * <p>
+   *
+   * Returns the smallest power of two greater than or equal to {@code x}.
+   *
+   * @param x
+   * @return
+   */
   static int ceilingPowerOfTwo(int x) {
     // From Hacker's Delight, Chapter 3, Harry S. Warren Jr.
     return 1 << -Integer.numberOfLeadingZeros(x - 1);
@@ -678,10 +688,10 @@ public final class Caffeine<K extends Object, V extends Object> {
     return this;
   }
 
-  // ==============================过期时间相关====================================
+  // ==============================过期策略相关====================================
 
   /**
-   * 指定在最后一次写之后多长时间过期。
+   * 基于存活时间的驱逐策略，指定在最后一次写之后存活多长时间驱逐。
    * 内部进行缓存维护的时候会自动删除过期数据，即使还没来的及删除，在 get 的时候也会进行校验不会读到过期数据。
    * <p>
    *
@@ -741,7 +751,7 @@ public final class Caffeine<K extends Object, V extends Object> {
   }
 
   /**
-   * 指定在最后一次访问(读|写)后多长时间过期
+   * 基于空闲时间的驱逐策略，在最后一次访问(读|写)后空闲多长时间过期
    * <p>
    *
    * Specifies that each entry should be automatically removed from the cache once a fixed duration

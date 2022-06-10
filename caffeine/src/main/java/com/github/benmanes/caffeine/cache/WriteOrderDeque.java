@@ -22,6 +22,10 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 import com.github.benmanes.caffeine.cache.WriteOrderDeque.WriteOrder;
 
 /**
+ * 顺序写队列。
+ * 和顺序访问队列类似
+ *
+ * <p>
  * A linked deque implementation used to represent a write-order queue.
  *
  * @author ben.manes@gmail.com (Ben Manes)
@@ -34,7 +38,10 @@ final class WriteOrderDeque<E extends WriteOrder<E>> extends AbstractLinkedDeque
     return (o instanceof WriteOrder<?>) && contains((WriteOrder<?>) o);
   }
 
-  // A fast-path containment check
+  /**
+   * 快速判断元素是否在顺序写队列中。
+   * 只要元素有相邻节点或元素是头节点即认为元素在队列中
+   */
   boolean contains(WriteOrder<?> e) {
     return (e.getPreviousInWriteOrder() != null)
         || (e.getNextInWriteOrder() != null)

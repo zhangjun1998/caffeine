@@ -196,12 +196,12 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
 
   static final Logger logger = System.getLogger(BoundedLocalCache.class.getName());
 
-  // 写缓冲区相关，最大容量与 CPU 核心数相关
+  // 缓冲区相关，最大容量与 CPU 核心数相关
   /** The number of CPUs */
   static final int NCPU = Runtime.getRuntime().availableProcessors();
-  /** The initial capacity of the write buffer. */
+  /** 写缓冲区的初始容量 */
   static final int WRITE_BUFFER_MIN = 4;
-  /** The maximum capacity of the write buffer. */
+  /** 写缓冲区的最大容量 */
   static final int WRITE_BUFFER_MAX = 128 * ceilingPowerOfTwo(NCPU);
   /** The number of attempts to insert into the write buffer before yielding. */
   static final int WRITE_BUFFER_RETRIES = 100;
@@ -257,7 +257,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   final Buffer<Node<K, V>> readBuffer;
   // 用于 Node 相关的操作，如创建、引用包装等
   final NodeFactory<K, V> nodeFactory;
-  // 在驱逐时候加的锁
+  // 在清理缓冲区、维护缓存时候需要加的锁
   final ReentrantLock evictionLock;
   // 权重策略
   final Weigher<K, V> weigher;
@@ -302,7 +302,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     readBuffer = evicts() || collectKeys() || collectValues() || expiresAfterAccess()
         ? new BoundedBuffer<>()
         : Buffer.disabled();
-    // 读取策略，在缓存有过期/容量限制时使用到，会在清理 readBuffer/writeBuffer 时调用，用来更新 node 在所属队列中的顺序和访问频率，方便 W-TinyLFU 算法回收
+    // 访问策略，在缓存有过期/容量限制时使用到，会在清理 readBuffer/writeBuffer 时调用，用来更新 node 在所属队列中的顺序和访问频率，方便 W-TinyLFU 算法回收
+    // 调用 onAccess() 方法
     accessPolicy = (evicts() || expiresAfterAccess()) ? this::onAccess : e -> {};
     // 写缓冲区
     writeBuffer = new MpscGrowableArrayQueue<>(WRITE_BUFFER_MIN, WRITE_BUFFER_MAX);
@@ -335,22 +336,26 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
 
   /**
    * Window-TinyLFU 算法
+   * 在动态生成的『SSMS』类中体现的更直观
    *
-   * 整个缓存区域被划分为 window 和 main，window 与 main 的空间占比为 0.01 : 0.99 ，即 1：99，这一点在上面的常量定义中体现。
-   * main 空间又被划分为 probation 和 protect，它们的占比为 20:80，probation 用于存储冷数据，protect 用于存储热数据；
+   * 整个缓存区域被划分为 window 和 main，window 与 main 的空间占比为 1% : 99%；
+   * main 区域又被划分为 probation 和 protect，它们的占比为 20% : 80%，probation 用于存储冷数据，protect 用于存储热数据；
    * window 区域主要用于应对突发流量，它使用 LRU 算法进行淘汰；
-   * main 区域则使用 SLRU 和 TinyLFU 算法进行淘汰，其中 SLRU 体现在 probation 和 protected，TinyLFU 则体现在 protected；
+   * main 区域则使用 SLRU 和 TinyLFU 算法进行淘汰；
    *
-   * 新数据首先进入到 window 区域，如果 window 满，则会通过 LRU 进行淘汰晋升到 probation 区域。window 队列元素被访问后会被移动到队列尾部
-   * 元素的淘汰发生在 probation 区域，如果总容量超出，则会对 probation 队列的首尾元素进行频率PK，淘汰访问频率低的。probation 队列元素被访问后，该元素会晋升到 protected 区域
-   * protected 区域的元素是比较稳定的，如果容量超出，则淘汰的元素会进入到 probation 队列，在 probation 队列中重新进行淘汰。protected 队列元素被访问后会被移动到队列尾部
+   * 新加入的缓存首先进入到 window 区域，如果 window 满，则会通过 LRU 进行淘汰晋升到 probation 区域。
+   * 元素的淘汰发生在 probation 区域，如果总容量超出，则会对 probation 队列的首尾元素(也就是从 window 晋升和从 probation 淘汰的)根据 TinyLFU 记录的频率进行PK，淘汰访问频率低的。
+   * probation 队列元素被访问后，该元素会晋升到 protected 区域。
+   * protected 区域的元素是比较稳定的，如果容量超出，则淘汰的元素会进入到 probation 队列，在 probation 队列中重新进行淘汰。
    */
 
-  // ====== 顺序读队列 =======
+  // ====== 顺序访问队列，LRU，尾部为最近被访问的元素， 头部为最久未访问的元素 =======
 
   /**
-   * 顺序读队列，用于存放 W-TinyLFU 算法中 window 区域的数据；
-   * 属于 window 区，占据的空间百分比初始化为1%
+   * 顺序访问队列，用于存放 W-TinyLFU 算法中 window 区域的数据；
+   * 属于 window 区，占据的空间为总缓存大小的1%；
+   * 使用 LRU 算法进行淘汰；
+   * 用于基于容量驱逐与基于空闲时间驱逐的策略
    */
   @GuardedBy("evictionLock")
   protected AccessOrderDeque<Node<K, V>> accessOrderWindowDeque() {
@@ -358,8 +363,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /**
-   * 顺序读队列，用于存放 W-TinyLFU 算法中 probation 区域的数据；
-   * 属于 main 区，占据main空间的百分比初始化为20%；
+   * 顺序访问队列，用于存放 W-TinyLFU 算法中 probation 区域的数据；
+   * 属于 main 区，占据 main 区域的20%；
    * 使用 LRU 算法进行淘汰；
    */
   @GuardedBy("evictionLock")
@@ -367,15 +372,20 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     throw new UnsupportedOperationException();
   }
 
-  // 顺序读队列，用于存放 W-TinyLFU 算法中 protect 区域的数据；属于 main 区，占据main空间的百分比初始化为80%
+  /**
+   * 顺序访问队列，用于存放 W-TinyLFU 算法中 protect 区域的数据；
+   * 属于 main 区，占据 main 区域的80%;
+   * 使用 LRU 算法进行淘汰；
+   */
   @GuardedBy("evictionLock")
   protected AccessOrderDeque<Node<K, V>> accessOrderProtectedDeque() {
     throw new UnsupportedOperationException();
   }
 
-  // ========= 顺序写队列 =========
+  // ========= 顺序写队列 LRU，尾部为最近被写入的元素， 头部为写入时间最早的元素(存活时间最长) =========
+
   /**
-   * 顺序写队列，用于 expireAfterWrite 的驱逐策略；
+   * 顺序写队列，用于基于存活时间(expireAfterWrite)的驱逐策略；
    * 它的入队出队操作被封装在 writeBuffer 中的任务中，AddTask、UpdateTask、RemoveTask 都会对该队列进行操作。
    */
   @GuardedBy("evictionLock")
@@ -612,17 +622,32 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     return false;
   }
 
-  /** Returns the maximum weighted size. */
+  /**
+   * 缓存的最大元素数量限制
+   * <p>
+   *
+   * Returns the maximum weighted size.
+   */
   protected long maximum() {
     throw new UnsupportedOperationException();
   }
 
-  /** Returns the maximum weighted size of the window space. */
+  /**
+   * window 区域的最大元素数量限制
+   * <p>
+   *
+   * Returns the maximum weighted size of the window space.
+   */
   protected long windowMaximum() {
     throw new UnsupportedOperationException();
   }
 
-  /** Returns the maximum weighted size of the main's protected space. */
+  /**
+   * protected 区域的最大元素数量限制
+   * <p>
+   *
+   * Returns the maximum weighted size of the main's protected space.
+   */
   protected long mainProtectedMaximum() {
     throw new UnsupportedOperationException();
   }
@@ -756,24 +781,39 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /**
-   * 缓存容量达到上限，根据 W-TinyLFU 算法驱逐元素
+   * 缓存容量达到上限，根据 W-TinyLFU 算法驱逐元素：
+   * <ol>
+   *     <li>新加入的缓存首先进入到 window 区域，如果 window 满，则会通过 LRU 将淘汰的缓存晋升到 probation 区域</li>
+   *     <li>元素的淘汰发生在 probation 区域，如果总容量超出，则会对 probation 队列的首尾元素(也就是从 window 晋升和从 probation 淘汰的)根据 TinyLFU 记录的频率进行PK，淘汰访问频率低的</li>
+   *     <li>probation 队列元素被访问后，该元素会晋升到 protected 区域</li>
+   *     <li>protected 区域的元素是比较稳定的，如果容量超出，则淘汰的元素会重新进入到 probation 队列，在 probation 队列中重新进行淘汰</li>
+   * </ol>
    * <p>
    *
    * Evicts entries if the cache exceeds the maximum.
    */
   @GuardedBy("evictionLock")
   void evictEntries() {
+    // evicts() 方法会被动态生成的子类重写，决定是否需要进行缓存驱逐
     if (!evicts()) {
       return;
     }
-    // 先从 window 区域驱逐，返回从 window 区域驱逐的元素数量
+    // 驱逐 window 区域的数据
     int candidates = evictFromWindow();
-    // 再从 main 区域驱逐
+    // 驱逐 main 区域的数据
     evictFromMain(candidates);
   }
 
   /**
-   * 驱逐 window 区域的数据
+   * 驱逐 window 区域的数据：
+   * <ol>
+   *     <li>死循环清理，直到 window 区域元素数量低于阈值时终止</li>
+   *     <li>根据 node 的权重判断，权重为0的 node 跳过清理</li>
+   *     <li>先设置 node 所属的 queueType 为 probation</li>
+   *     <li>将该 node 从 window 区域移除</li>
+   *     <li>将该 node 加入到 probation 区域的尾部</li>
+   *     <li>candidates 的数量+1</li>
+   * </ol>
    * <p>
    *
    * Evicts entries from the window space into the main space while the window size exceeds a
@@ -783,21 +823,30 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    */
   @GuardedBy("evictionLock")
   int evictFromWindow() {
+    // 从 window 区域淘汰的元素数量
     int candidates = 0;
+    // 从 window 区域的头部开始移除
     Node<K, V> node = accessOrderWindowDeque().peek();
+    // 死循环，直到 window 区域的元素数量低于阈值
     while (windowWeightedSize() > windowMaximum()) {
       // The pending operations will adjust the size to reflect the correct weight
       if (node == null) {
         break;
       }
-
+      // 当前元素的下一个元素
       Node<K, V> next = node.getNextInAccessOrder();
+      // 根据权重判断是否需要清理
       if (node.getPolicyWeight() != 0) {
+        // 先设置 node 所属的 queueType 为 probation
         node.makeMainProbation();
+        // 从 window 区域移除该 node
         accessOrderWindowDeque().remove(node);
+        // 将该 node 加入到 probation 区域的尾部
         accessOrderProbationDeque().add(node);
+        // 数量+1
         candidates++;
 
+        // 更新 window 区域当前的元素数量
         setWindowWeightedSize(windowWeightedSize() - node.getPolicyWeight());
       }
       node = next;
@@ -807,6 +856,16 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /**
+   * 驱逐 main 区域的缓存：
+   * <ol>
+   *     <li>死循环，直到总缓存的元素数量低于阈值</li>
+   *     <li>(candidate == null) && (victim== null) 的情况，从 protected 区域和 window 区域驱逐</li>
+   *     <li>(victim == null) || (candidate == null) 的情况，立即淘汰不为 null 的那个</li>
+   *     <li>(victim.key == null) || (candidate.key == null) 的情况，立即淘汰为 null 的</li>
+   *     <li>candidate 的权重大于最大容量限制的情况，立即淘汰 candidate</li>
+   *     <li>以上条件都不符合，将 victim 和 candidate 根据访问频率进行PK</li>
+   * </ol>
+   *
    * Evicts entries from the main space if the cache exceeds the maximum capacity. The main space
    * determines whether admitting an entry (coming from the window space) is preferable to retaining
    * the eviction policy's victim. This decision is made using a frequency filter so that the
@@ -821,16 +880,22 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    */
   @GuardedBy("evictionLock")
   void evictFromMain(int candidates) {
+
+    // 选取出 victim 的队列
     int victimQueue = PROBATION;
+    // probation 区域首部的元素
     Node<K, V> victim = accessOrderProbationDeque().peekFirst();
+    // probation 区域尾部的元素，也就是从 window 区域淘汰晋升进来的
     Node<K, V> candidate = accessOrderProbationDeque().peekLast();
+
+    // 死循环，直到总缓存的元素数量低于阈值
     while (weightedSize() > maximum()) {
-      // Search the admission window for additional candidates
+      // 从 window 区域淘汰的数量为0，直接获取 window 尾部的元素作为 candidate
       if (candidates == 0) {
         candidate = accessOrderWindowDeque().peekLast();
       }
 
-      // Try evicting from the protected and window queues
+      // 1. (candidate == null) && (victim== null) 的情况，从 protected 区域和 window 区域驱逐
       if ((candidate == null) && (victim == null)) {
         if (victimQueue == PROBATION) {
           victim = accessOrderProtectedDeque().peekFirst();
@@ -846,7 +911,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         break;
       }
 
-      // Skip over entries with zero weight
+      // 跳过权重为0的node
       if ((victim != null) && (victim.getPolicyWeight() == 0)) {
         victim = victim.getNextInAccessOrder();
         continue;
@@ -858,7 +923,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         continue;
       }
 
-      // Evict immediately if only one of the entries is present
+      // 2. (victim == null) || (candidate == null) 的情况，立即淘汰不为 null 的那个
+
+      // victim == null，立即淘汰 candidate
       if (victim == null) {
         @SuppressWarnings("NullAway")
         Node<K, V> previous = candidate.getPreviousInAccessOrder();
@@ -868,13 +935,14 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         evictEntry(evict, RemovalCause.SIZE, 0L);
         continue;
       } else if (candidate == null) {
+        // candidate == null，立即淘汰 victim
         Node<K, V> evict = victim;
         victim = victim.getNextInAccessOrder();
         evictEntry(evict, RemovalCause.SIZE, 0L);
         continue;
       }
 
-      // Evict immediately if an entry was collected
+      // 3. (victim.key == null) || (candidate.key == null) 的情况，立即淘汰为 null 的
       K victimKey = victim.getKey();
       K candidateKey = candidate.getKey();
       if (victimKey == null) {
@@ -892,7 +960,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         continue;
       }
 
-      // Evict immediately if the candidate's weight exceeds the maximum
+      // 4. candidate 的权重大于最大容量限制的情况，立即淘汰 candidate
       if (candidate.getPolicyWeight() > maximum()) {
         Node<K, V> evict = candidate;
         candidate = (candidates > 0)
@@ -903,15 +971,21 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         continue;
       }
 
-      // Evict the entry with the lowest frequency
+      // 5. 以上条件都不符合，将 victim 和 candidate 根据访问频率进行PK，淘汰访问频率低的
+      // 这里的比较规则是，依次对所有 candidate 做PK，胜出的留下并挑选下一个继续，而 victim 则只在失败被淘汰才会更新为下一个 node
       candidates--;
+      // 决定 candidate 和 victim 哪一个应该被淘汰
       if (admit(candidateKey, victimKey)) {
+        // victimKey 的访问频率较低，淘汰 victim
         Node<K, V> evict = victim;
         victim = victim.getNextInAccessOrder();
         evictEntry(evict, RemovalCause.SIZE, 0L);
+        // 这里PK过的 candidate 不会在下一轮继续，而是选取下一个 candidate 与 新的 victim 进行PK
         candidate = candidate.getPreviousInAccessOrder();
       } else {
+        // candidate 的访问频率比较低，淘汰 candidate
         Node<K, V> evict = candidate;
+        // 继续选择下一个 candidate 进行PK，但是 victim 还是当前的这个
         candidate = (candidates > 0)
             ? candidate.getPreviousInAccessOrder()
             : candidate.getNextInAccessOrder();
@@ -921,6 +995,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /**
+   * 决定 candidate 和 victim 哪一个应该被淘汰：
+   * <ol>
+   *     <li>candidate 的访问频率大于 victim，淘汰 victim</li>
+   *     <li>candidate 的访问频率小于 victim 且 candidate 的访问频率 <= 5，淘汰 candidate</li>
+   *     <li>candidate 的访问频率小于 victim 但是又大于5，随机淘汰</li>
+   * </ol>
+   *
    * Determines if the candidate should be accepted into the main space, as determined by its
    * frequency relative to the victim. A small amount of randomness is used to protect against hash
    * collision attacks, where the victim's frequency is artificially raised so that no new entries
@@ -932,16 +1013,20 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    */
   @GuardedBy("evictionLock")
   boolean admit(K candidateKey, K victimKey) {
+    // victim 的访问频率
     int victimFreq = frequencySketch().frequency(victimKey);
+    // candidate 的访问频率
     int candidateFreq = frequencySketch().frequency(candidateKey);
+
+    // 1. candidate 的访问频率大于 victim，淘汰 victim
     if (candidateFreq > victimFreq) {
       return true;
     } else if (candidateFreq <= 5) {
-      // The maximum frequency is 15 and halved to 7 after a reset to age the history. An attack
-      // exploits that a hot candidate is rejected in favor of a hot victim. The threshold of a warm
-      // candidate reduces the number of random acceptances to minimize the impact on the hit rate.
+      // 2. candidate 的访问频率小于 victim 且 candidate 的访问频率 <= 5，淘汰 candidate
+      // 主要是因为 candidate 的访问频率 >5 时再次被访问的概率也很高，处于一个上升期
       return false;
     }
+    // 3. candidate 的访问频率小于 victim 但是又大于5，随机淘汰
     int random = ThreadLocalRandom.current().nextInt();
     return ((random & 127) == 0);
   }
@@ -1064,8 +1149,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     if (isComputingAsync(node)) {
       return false;
     }
-    // 这里会校验所有的过期策略，包括 基于最后访问(读|写)时间、基于最后写入时间、基于自定义过期策略，只要任一校验通过即可
-    // 正是因为这些校验，因此 afterRead 操作才需要尽量立即清理缓冲区，因为如果不及时更新最后写入时间，这次的读操作读取到的就还是上次的写入时间，如果上次写入时间到期就会重新加载/驱逐进而导致最近的写操作丢失
+    // 这里会校验所有的过期策略，包括 基于最后访问时间(空闲时间)、基于最后写入时间(存活时间)、基于自定义过期策略，只要任一校验通过即可
+    // 正是因为这些校验，因此 afterRead 操作才需要尽量立即清理缓冲区，因为如果不及时更新最后写入时间，这次的读操作读取到的就还是上次的写入时间，
+    // 如果上次写入时间到期就会重新加载/驱逐进而导致最近的写操作丢失
     return (expiresAfterAccess() && (now - node.getAccessTime() >= expiresAfterAccessNanos()))
         | (expiresAfterWrite() && (now - node.getWriteTime() >= expiresAfterWriteNanos()))
         | (expiresVariable() && (now - node.getVariableTime() >= 0));
@@ -1219,14 +1305,20 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
       return;
     }
 
+    // 确定 window 区域需要调整的大小
     determineAdjustment();
+    // 如果 protected 区域的缓存有溢出，将溢出部分移动到 probation 区域
     demoteFromMainProtected();
+    // 需要调整的大小
     long amount = adjustment();
     if (amount == 0) {
+      // 调整大小 == 0，不调整
       return;
     } else if (amount > 0) {
+      // 调整大小 > 0，增大 window 区域
       increaseWindow();
     } else {
+      // 调整大小 < 0，减小 window 区域
       decreaseWindow();
     }
   }
@@ -1241,17 +1333,23 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
       return;
     }
 
+    // 总的请求量 = 命中 + 错失
     int requestCount = hitsInSample() + missesInSample();
     if (requestCount < frequencySketch().sampleSize) {
       return;
     }
 
+    // 命中率
     double hitRate = (double) hitsInSample() / requestCount;
+    // 本次命中率减去上次命中率的差距
     double hitRateChange = hitRate - previousSampleHitRate();
+    // 本次调整的大小，由命中率差值和上次的步长决定
     double amount = (hitRateChange >= 0) ? stepSize() : -stepSize();
+    // 下次调整大小
     double nextStepSize = (Math.abs(hitRateChange) >= HILL_CLIMBER_RESTART_THRESHOLD)
         ? HILL_CLIMBER_STEP_PERCENT * maximum() * (amount >= 0 ? 1 : -1)
         : HILL_CLIMBER_STEP_DECAY_RATE * amount;
+
     setPreviousSampleHitRate(hitRate);
     setAdjustment((long) amount);
     setStepSize(nextStepSize);
@@ -1370,7 +1468,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /**
-   * 读操作后的处理，将读到的 node 丢到 readBuffer 中，如果 readBuffer 满了就顺带清理一波
+   * 访问操作的后置处理，将读到的 node 丢到 readBuffer 中，如果 readBuffer 满了就顺带清理一波
    * 注意：这个方法不是只有 get() 才会调用，而是在实际有读操作发生的时候就会调用，比如 putIfAbsent() 操作就会先读取旧值，这时候也会进行 afterRead()
    * <p>
    *
@@ -1382,6 +1480,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    * @return the refreshed value if immediately loaded, else null
    */
   @Nullable V afterRead(Node<K, V> node, long now, boolean recordHit) {
+    // 缓存情况统计
     if (recordHit) {
       statsCounter().recordHits(1);
     }
@@ -1615,7 +1714,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /**
-   * 设置可存活时间，这用在自定义 Expire 过期策略中
+   * 设置过期时间，这用在自定义 Expire 过期策略中
    */
   void setVariableTime(Node<K, V> node, long expirationTime) {
     if (expiresVariable()) {
@@ -1637,7 +1736,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
 
 
   /**
-   * 写操作后的一些处理，主要是将写行为封装为对应的task 丢到 writeBuffer 中，如果写缓冲区满了就顺带进行一次缓存维护。
+   * 写操作的后置处理，主要是将写行为封装为对应的task 丢到 writeBuffer 中，如果写缓冲区满了就顺带进行一次缓存维护。
    * 写操作相关的 Task：{@link AddTask}、{@link UpdateTask}、{@link RemovalTask}。
    * 在这些 Task 中都会对 {@link #writeOrderDeque()} 进行操作。
    * 注意：这个方法不是只有 put() 才会调用，而是在实际有写操作发生的时候就会调用，比如 get() 失败执行缓存自动加载时就会进行写入，这时候也会进行 afterWrite()。
@@ -1650,7 +1749,6 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   void afterWrite(Runnable task) {
     // 注意这里和 afterRead() 的区别，afterRead() 在缓冲区空闲的时候不会立即清理缓冲区，只有缓冲区满才会进行一次清理，而 afterWrite() 每次都会清理缓冲区；
     // 这里还做了重试保证 write 操作不会丢失，并且会在 offer 成功后尽量进行一次缓存清理任务的调度，用于降低延迟，防止发生写入丢失
-    // 其实我觉得没必要为了这个降低性能，
 
     // 循环重试，最大重试100次
     for (int i = 0; i < WRITE_BUFFER_RETRIES; i++) {
@@ -1675,6 +1773,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     // running computation due to an eviction listener, the victim being computed on by other write,
     // or the victim residing in the same hash bin as a computing entry. In those cases a warning is
     // logged to encourage the application to decouple these computations from the map operations.
+
+    // 加锁
     lock();
     try {
       // 维护缓存，这里还把 afterWrite() 中的 task 作为参数传到了 maintenance() 方法中，来保证缓冲区满的情况下在缓存维护过程中将这个 task 执行掉，避免丢失
@@ -1867,7 +1967,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
       // 缓存驱逐，这里体现了 W-TinyLFU 算法的思路
       evictEntries();
 
-      // 根据最近访问/访问频率动态调整驱逐策略，达到最佳驱逐效果
+      // 根据最近访问/访问频率动态调整window区域缓存的大小，达到最佳命中率
       climb();
 
     } finally {
@@ -1935,6 +2035,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   @GuardedBy("evictionLock")
   void drainReadBuffer() {
     if (!skipReadBuffer()) {
+      // 清理读缓冲区，这里清理的是带状缓冲区中的所有环形缓冲区，而不仅仅是当前线程占用的环形缓冲区
       // 这里将 accessPolicy 作为参数，清理 readBuffer 中每个 node 时都会调用一次 accessPolicy，用于调整 node 在对应队列中的排序
       readBuffer.drainTo(accessPolicy);
     }
@@ -1948,7 +2049,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    */
   @GuardedBy("evictionLock")
   void onAccess(Node<K, V> node) {
-    // 允许驱逐
+    // 配置了缓存驱逐
     if (evicts()) {
       K key = node.getKey();
       if (key == null) {
@@ -1957,46 +2058,66 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
       // 增加 node 的访问频率
       frequencySketch().increment(key);
 
-      // 更新 node 在所属队列的排序
+      // 更新 node 在所属顺序访问队列中的排序
       if (node.inWindow()) {
+        // 访问的 node 在 window 区域，移动到 window 尾部
         reorder(accessOrderWindowDeque(), node);
       } else if (node.inMainProbation()) {
+        // 访问的 node 在 probation 区域，移动到 protected 区域或移动到 probation 尾部
         reorderProbation(node);
       } else {
+        // 访问的 node 在 protected 区域，移动到 protected 尾部
         reorder(accessOrderProtectedDeque(), node);
       }
+      // 命中的缓存数量+1，用于后续计算缓存命中率，动态调整 window 区域大小
       setHitsInSample(hitsInSample() + 1);
-    } // 过期
+    } // 配置了按最后访问时间过期
     else if (expiresAfterAccess()) {
       reorder(accessOrderWindowDeque(), node);
     }
 
-    // 一段时候后过期，丢到时间轮中
+    // 配置了自定义过期策略，丢到时间轮中调度
     if (expiresVariable()) {
       timerWheel().reschedule(node);
     }
   }
 
-  /** Promote the node from probation to protected on an access. */
+  /**
+   * 处于 probation 区域的 node 被访问，更新排序或移动到 protected 区域
+   * <p>
+   *
+   * Promote the node from probation to protected on an access.
+   */
   @GuardedBy("evictionLock")
   void reorderProbation(Node<K, V> node) {
     if (!accessOrderProbationDeque().contains(node)) {
       // Ignore stale accesses for an entry that is no longer present
       return;
     } else if (node.getPolicyWeight() > mainProtectedMaximum()) {
+      // node 的权重超过 protected 的元素数量限制，那么继续停留在 probation 中，只是移动到尾部
       reorder(accessOrderProbationDeque(), node);
       return;
     }
 
     // If the protected space exceeds its maximum, the LRU items are demoted to the probation space.
     // This is deferred to the adaption phase at the end of the maintenance cycle.
+
+    // 更新 protected 区域的 weight
     setMainProtectedWeightedSize(mainProtectedWeightedSize() + node.getPolicyWeight());
+    // 将 node 从 probation 区域中移除
     accessOrderProbationDeque().remove(node);
+    // 将 node 加入到 protected 区域尾部
     accessOrderProtectedDeque().add(node);
+    // 更新 node 所在的区域
     node.makeMainProtected();
   }
 
-  /** Updates the node's location in the policy's deque. */
+  /**
+   * 更新 node 在指定队列中的排序(移动到末尾)
+   * <p>
+   *
+   * Updates the node's location in the policy's deque.
+   */
   static <K, V> void reorder(LinkedDeque<Node<K, V>> deque, Node<K, V> node) {
     // An entry may be scheduled for reordering despite having been removed. This can occur when the
     // entry was concurrently read while a writer was removing it. If the entry is no longer linked
@@ -2007,13 +2128,14 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   /**
-   * 清理写缓冲区
+   * 清理写缓冲区，依次执行写缓冲区中的所有 task
    * <p>
    *
    * Drains the write buffer.
    */
   @GuardedBy("evictionLock")
   void drainWriteBuffer() {
+    // 遍历写缓冲区，执行缓冲区中的任务
     for (int i = 0; i <= WRITE_BUFFER_MAX; i++) {
       Runnable task = writeBuffer.poll();
       if (task == null) {
@@ -2051,13 +2173,15 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     }
   }
 
-  /** Adds the node to the page replacement policy. */
   /**
-   * 写操作之add的处理策略，包含以下几点
+   * 写操作之add的处理策略，包含以下几点：
+   * <ol>
+   *     <li>策略权重、访问频率的维护</li>
+   *     <li>将 node 按权重排序丢到 window 区域，权重大的在队首，权重小的队尾，如果自定义了过期策略，还要将 node 丢到时间轮中</li>
+   *     <li>若正在进行异步计算，更新 node 的最后访问时间、最后写入时间、自定义策略的可存活时间，避免在进行异步计算时 node 过期</li>
+   * </ol>
    *
-   * 1. 策略权重、访问频率的维护
-   * 2. 将 node 按权重排序丢到 window 区域，权重大的在队首，权重小的队尾，如果自定义了过期策略，还要将 node 丢到时间轮中
-   * 3. 更新 node 的最后访问时间、最后写入时间、自定义策略的可存活时间
+   * Adds the node to the page replacement policy.
    */
   final class AddTask implements Runnable {
     final Node<K, V> node;
@@ -2072,7 +2196,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     @GuardedBy("evictionLock")
     @SuppressWarnings("FutureReturnValueIgnored")
     public void run() {
-      // 1. 定义了驱逐策略时，更新 node 的访问频率和权重
+      // 1. 配置了缓存驱逐时，更新 node 的访问频率和权重
       if (evicts()) {
         long weightedSize = weightedSize();
         setWeightedSize(weightedSize + weight);
@@ -2086,34 +2210,40 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
           frequencySketch().ensureCapacity(capacity);
         }
 
+        // 频率计数
         K key = node.getKey();
         if (key != null) {
           frequencySketch().increment(key);
         }
 
+        // 未命中的缓存数量+1
         setMissesInSample(missesInSample() + 1);
       }
 
-      // node 还存活时，将 node 入队到 window 区域，如果自定义了过期策略还需要丢到时间轮中
+      // 2. node 还存活时，将 node 入队到 window 区域，如果自定义了过期策略还需要丢到时间轮中
       boolean isAlive;
       synchronized (node) {
         isAlive = node.isAlive();
       }
       if (isAlive) {
+        // 配置了 expiresAfterWrite()，添加到顺序写队列的尾部
         if (expiresAfterWrite()) {
           writeOrderDeque().add(node);
         }
+        // 配置了驱逐且权重超过了 window 的总和，放在 window 区域的首部(尽快淘汰)
         if (evicts() && (weight > windowMaximum())) {
           accessOrderWindowDeque().offerFirst(node);
         } else if (evicts() || expiresAfterAccess()) {
+          // 配置了驱逐或过期，加入到 window 区域的尾部
           accessOrderWindowDeque().offerLast(node);
         }
+        // 配置了自定义过期策略，加入到时间轮中进行调度
         if (expiresVariable()) {
           timerWheel().schedule(node);
         }
       }
 
-      // 更新 node 的可存活时间、最后访问时间、最后写入时间，避免在进行异步计算时 node 过期
+      // 3. 如果正在进行异步计算，更新 node 的可存活时间、最后访问时间、最后写入时间，避免在进行异步计算时 node 过期
       if (isComputingAsync(node)) {
         synchronized (node) {
           if (!Async.isReady((CompletableFuture<?>) node.getValue())) {
@@ -2124,14 +2254,17 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
           }
         }
       }
+
     }
   }
 
   /**
    * 写操作之remove的处理策略，包含以下几点：
    * <ol>
-   *     <li>将 node 从所属的队列中/时间轮移除</li>
-   *     <li>设置 node 状态为 dead</li>
+   *     <li>如果 node 在 window 区域，直接移除</li>
+   *     <li>如果配置了驱逐缓存，将 node 从所属队列中移除</li>
+   *     <li>如果配置了写过期策略，从顺序写队列或时间轮中移除</li>
+   *     <li>设置 node 的状态为 dead</li>
    * </ol>
    * <p>
    *
@@ -2147,19 +2280,24 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     @Override
     @GuardedBy("evictionLock")
     public void run() {
-      // 将 node 从所属的读写队列/时间轮中移除
+      // 1. node 在 window 区域，直接移除
       if (node.inWindow() && (evicts() || expiresAfterAccess())) {
         accessOrderWindowDeque().remove(node);
-      } else if (evicts()) {
+      }
+      // 2. 配置了驱逐缓存，将 node 从所属队列中移除
+      else if (evicts()) {
         if (node.inMainProbation()) {
           accessOrderProbationDeque().remove(node);
         } else {
           accessOrderProtectedDeque().remove(node);
         }
       }
+      // 3. 配置了写过期策略
+      // 配置了 expireAfterWrite()，从顺序写队列中移除
       if (expiresAfterWrite()) {
         writeOrderDeque().remove(node);
       } else if (expiresVariable()) {
+        // 配置了自定义过期策略，从时间轮中移除
         timerWheel().deschedule(node);
       }
 
@@ -2171,10 +2309,10 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   /**
    * 写操作之update的处理策略，包含以下几点：
    * <ol>
-   *     <li>更新 node 在所属读队列的顺序</li>
-   *     <li>更新 node 在所属写队列/时间轮的顺序</li>
+   *     <li>配置了驱逐策略时，更新 node 所属的队列、排序、访问频率、权重等，执行访问操作的后置策略</li>
+   *     <li>配置了读后过期策略时，执行访问后置策略</li>
+   *     <li>配置了写后过期策略时，更新 node 在顺序写队列或时间轮中的顺序</li>
    * </ol>
-   * <p>
    *
    * Updates the weighted size.
    */
@@ -2191,30 +2329,38 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     @GuardedBy("evictionLock")
     public void run() {
 
+      // 配置了驱逐策略时
       if (evicts()) {
         int oldWeightedSize = node.getPolicyWeight();
         node.setPolicyWeight(oldWeightedSize + weightDifference);
 
-        // 1. 更新 node 在所属读队列的顺序
-        if (node.inWindow()) {
+        // 1. 更新 node 所属的队列、排序、访问频率、权重等，执行访问操作的后置策略
+        if (node.inWindow()) { // node 在 window 区域中
+          // node 在 window 区域中，调用 onAccess() 方法更新 node
           if (node.getPolicyWeight() <= windowMaximum()) {
+            // 正常情况下，调用访问策略(相当于执行访问的后置操作)
             onAccess(node);
           } else if (accessOrderWindowDeque().contains(node)) {
+            // node 的权重超出了 window 区域最大容量，丢到 window 区域的首部，尽快淘汰
             accessOrderWindowDeque().moveToFront(node);
           }
           setWindowWeightedSize(windowWeightedSize() + weightDifference);
-        } else if (node.inMainProbation()) {
+        } else if (node.inMainProbation()) { // node 在 probation 区域中
             if (node.getPolicyWeight() <= maximum()) {
+              // 正常情况下，调用访问策略(相当于执行访问的后置操作)
               onAccess(node);
             } else if (accessOrderProbationDeque().remove(node)) {
+              // node 的权重超出了 probation 区域最大容量，从 probation 中移除并加入到 window 首部
               accessOrderWindowDeque().addFirst(node);
               setWindowWeightedSize(windowWeightedSize() + node.getPolicyWeight());
             }
-        } else if (node.inMainProtected()) {
+        } else if (node.inMainProtected()) { // node 在 protected 区域中
           if (node.getPolicyWeight() <= maximum()) {
+            // 正常情况下，调用访问策略(相当于执行访问的后置操作)
             onAccess(node);
             setMainProtectedWeightedSize(mainProtectedWeightedSize() + weightDifference);
           } else if (accessOrderProtectedDeque().remove(node)) {
+            // node 的权重超出了 protected 区域最大容量，从 protected 中移除并加入到 window 首部
             accessOrderWindowDeque().addFirst(node);
             setWindowWeightedSize(windowWeightedSize() + node.getPolicyWeight());
             setMainProtectedWeightedSize(mainProtectedWeightedSize() - oldWeightedSize);
@@ -2223,14 +2369,19 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
           }
         }
         setWeightedSize(weightedSize() + weightDifference);
-      } else if (expiresAfterAccess()) {
+      }
+      // 配置了基于空闲时间的驱逐策略
+      else if (expiresAfterAccess()) {
+        // 执行访问后置操作
         onAccess(node);
       }
 
-      // 2. 更新 node 在所属写队列/时间轮中的排序
+      // 2. 配置了基于存活时间/自定义的驱逐策略，更新 node 在顺序写队列或时间轮中的顺序
+      // 配置了 expireAfterWrite()，更新 node 在顺序写队列中的排序
       if (expiresAfterWrite()) {
         reorder(writeOrderDeque(), node);
       } else if (expiresVariable()) {
+        // 自定义了过期策略
         timerWheel().reschedule(node);
       }
     }

@@ -20,13 +20,13 @@ import java.lang.invoke.VarHandle;
 import java.util.function.Consumer;
 
 /**
+ * 带状非阻塞的有界缓冲区实现。
+ * 继承了{@link com.github.benmanes.caffeine.cache.StripedBuffer}，内部有一个 {@link RingBuffer} 类实现了环形缓冲区
+ *
  * A striped, non-blocking, bounded buffer.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  * @param <E> the type of elements maintained by this buffer
- */
-/**
- * 有界的带状缓冲区实现类
  */
 final class BoundedBuffer<E> extends StripedBuffer<E> {
   /*
@@ -75,39 +75,58 @@ final class BoundedBuffer<E> extends StripedBuffer<E> {
       BUFFER.set(buffer, 0, e);
     }
 
+    /**
+     * 将元素加入到缓冲区
+     */
     @Override
     public int offer(E e) {
+      // 读计数
       long head = readCounter;
+      // 写计数
       long tail = writeCounterOpaque();
+      // 读写计数之间的差值就是缓冲区中的元素数量，可以用来判断缓冲区是否已满
       long size = (tail - head);
       if (size >= BUFFER_SIZE) {
         return Buffer.FULL;
       }
+      // CAS 操作更新 writeCounter 的值来保证并发安全，CAS 操作成功才允许操作
       if (casWriteCounter(tail, tail + 1)) {
         int index = (int) (tail & MASK);
         BUFFER.setRelease(buffer, index, e);
         return Buffer.SUCCESS;
       }
+      // CAS 操作失败说明有其它线程在竞争，那么需要对带状缓冲区进行扩容避免线程竞争
       return Buffer.FAILED;
     }
 
+    /**
+     * 清理环形缓冲区，有一个 consumer 参数，每清除一个元素都会调用一次 consumer。
+     * 由调用方加锁保证清理操作的并发安全
+     */
     @Override
     public void drainTo(Consumer<E> consumer) {
+      // 判断缓冲区中是否有数据
       long head = readCounter;
       long tail = writeCounterOpaque();
       long size = (tail - head);
       if (size == 0) {
         return;
       }
+
+      // 清理缓冲区
       do {
+        // 根据读计数器定位出 index
         int index = (int) (head & MASK);
         E e = (E) BUFFER.getAcquire(buffer, index);
+        // buffer[index] 为 null 表示后续缓冲区还未使用，结束清理
         if (e == null) {
-          // not published yet
           break;
         }
+        // 将 buffer[index] 设为 null
         BUFFER.setRelease(buffer, index, null);
+        // 每清理一个元素调用一次 consumer
         consumer.accept(e);
+        // 读计数器+1
         head++;
       } while (head != tail);
       setReadCounterOpaque(head);
@@ -170,8 +189,15 @@ final class BBHeader {
     byte p232, p233, p234, p235, p236, p237, p238, p239;
   }
 
-  /** Enforces a memory layout to avoid false sharing by padding the write counter. */
+  /**
+   * 缓冲区的读写计数器，通过读写计数器可以判断当前缓冲区的空闲状态。
+   * 在向缓冲区加入元素时可以通过 CAS 原子更新 counter 的形式来保证并发安全，只有原子更新成功才允许加入缓冲区
+   */
   abstract static class ReadAndWriteCounterRef extends PadWriteCounter {
+
+    /**
+     * VarHandle 是 JDK9 提供的一个快捷进行原子操作的类
+     */
     static final VarHandle READ, WRITE;
 
     volatile long writeCounter;
