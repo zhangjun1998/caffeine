@@ -41,6 +41,11 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  * 定位时间轮中元素则是先根据时间定位到对应粒度时间轮中的 bucket，然后遍历 bucket 关联的双向链表找到该元素。
  * <p>
  *
+ * 元素插入：元素的过期时间减去时间轮上次调度时间得到差值作为存活时间，根据存活时间计算出元素应该在第二层时间轮上的哪个 bucket 中，将其插入到该 bucket 关联的双向链表末尾
+ * <P>
+ * 时间轮调度：本次调度时间减去上次调度时间得到差值，根据该差值计算出应该调度的所有第二层时间轮和其中的 bucket，然后遍历 bucket 即可
+ *
+ *
  * A hierarchical timer wheel to add, remove, and fire expiration events in amortized O(1) time. The
  * expiration events are deferred until the timer is advanced, which is performed as part of the
  * cache's maintenance cycle.
@@ -146,9 +151,11 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
   }
 
   /**
-   * 进行时间轮调度
+   * 时间轮调度。
    * 触发时机：缓存维护期间
    * <p>
+   *
+   * 通过计算本次调度时间和上次调度时间的差值，得出时间轮上需要处理的所有 bucket，然后遍历每个 bucket 进行处理。
    *
    * Advances the timer and evicts entries that have expired.
    *
